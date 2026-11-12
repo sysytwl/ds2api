@@ -27,8 +27,10 @@ const (
 var (
 	// ErrSessionRequired means no ELM SESSION cookie was supplied.
 	ErrSessionRequired = errors.New("elm: SESSION cookie is required")
-	// ErrNotLoggedIn means ELM rejected the session cookie.
-	ErrNotLoggedIn = errors.New("elm: session cookie is not logged in")
+	// ErrSessionExpired means the ELM SESSION cookie is no longer logged in
+	// (expired, signed out, or rejected by the server). Callers should ask the
+	// operator for a fresh cookie instead of retrying.
+	ErrSessionExpired = errors.New("elm: SESSION cookie expired or logged out")
 )
 
 // DeltaKind tells a streaming consumer what kind of text arrived.
@@ -89,7 +91,12 @@ func New(baseURL string) *Client {
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
-	return &Client{baseURL: baseURL, http: &http.Client{Timeout: requestTimeout}}
+	return &Client{baseURL: baseURL, http: &http.Client{
+		Timeout: requestTimeout,
+		// ELM answers an expired session with a redirect to the login page;
+		// surface that instead of silently following it into HTML.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}}
 }
 
 // BaseURL is the configured ELM origin.
@@ -181,7 +188,16 @@ func (c *Client) doJSON(ctx context.Context, method, path, cookie string, header
 	if err != nil {
 		return fmt.Errorf("elm: %s %s: read body: %w", method, path, err)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return fmt.Errorf("%w: %s %s returned %d", ErrSessionExpired, method, path, resp.StatusCode)
+	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		location := strings.TrimSpace(resp.Header.Get("Location"))
+		if location == "" {
+			location = truncate(strings.TrimSpace(string(data)), 160)
+		}
+		return fmt.Errorf("%w: %s %s redirected to %s", ErrSessionExpired, method, path, location)
+	case resp.StatusCode < 200 || resp.StatusCode >= 300:
 		return fmt.Errorf("elm: %s %s: status %d: %s", method, path, resp.StatusCode, truncate(strings.TrimSpace(string(data)), 300))
 	}
 	if out == nil {
@@ -205,7 +221,10 @@ func (c *Client) IsLoggedIn(ctx context.Context, cookie string) (bool, error) {
 	if err := c.doJSON(ctx, http.MethodGet, "/api/open/is-logged-in", cookie, nil, nil, &out); err != nil {
 		return false, err
 	}
-	return out.IsLoggedIn, nil
+	if !out.IsLoggedIn {
+		return false, fmt.Errorf("%w: /api/open/is-logged-in returned false", ErrSessionExpired)
+	}
+	return true, nil
 }
 
 // User returns the account bound to the session.

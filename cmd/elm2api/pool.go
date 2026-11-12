@@ -48,6 +48,7 @@ type Session struct {
 	modelMu  sync.RWMutex
 	model    string
 	active   int64
+	expired  atomic.Bool
 }
 
 // Model returns the model last observed/selected for the session.
@@ -63,6 +64,11 @@ func (s *Session) setModel(model string) {
 	s.modelMu.Unlock()
 }
 
+// Expired reports whether the last upstream call proved the cookie dead.
+func (s *Session) Expired() bool { return s.expired.Load() }
+
+func (s *Session) markExpired(expired bool) { s.expired.Store(expired) }
+
 // SessionView is the JSON shape exposed by the management API.
 type SessionView struct {
 	ID      string        `json:"id"`
@@ -72,6 +78,7 @@ type SessionView struct {
 	Active  int64         `json:"active"`
 	Created time.Time     `json:"created"`
 	Quota   elmcore.Quota `json:"quota"`
+	Expired bool          `json:"expired"`
 }
 
 func sessionID(cookie string) string {
@@ -126,7 +133,7 @@ func (p *Pool) Add(ctx context.Context, name, cookie string) (SessionView, error
 		return SessionView{}, err
 	}
 	if !ok {
-		return SessionView{}, elmcore.ErrNotLoggedIn
+		return SessionView{}, elmcore.ErrSessionExpired
 	}
 	user, err := p.up.User(ctx, cookie)
 	if err != nil {
@@ -146,6 +153,7 @@ func (p *Pool) Add(ctx context.Context, name, cookie string) (SessionView, error
 			existing.User = user
 			existing.Quota = quota
 			existing.setModel(model)
+			existing.markExpired(false)
 			p.mu.Unlock()
 			return existing.view(), nil
 		}
@@ -154,6 +162,30 @@ func (p *Pool) Add(ctx context.Context, name, cookie string) (SessionView, error
 	p.sessions = append(p.sessions, s)
 	p.mu.Unlock()
 	return s.view(), nil
+}
+
+// addExpired keeps a session whose cookie already failed validation so the
+// dashboard can show it and the operator can replace the cookie.
+func (p *Pool) addExpired(name, cookie string) {
+	cookie = elmcore.NormalizeCookie(cookie)
+	if cookie == "" {
+		return
+	}
+	id := sessionID(cookie)
+	if name = strings.TrimSpace(name); name == "" {
+		name = "expired-session"
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, existing := range p.sessions {
+		if existing.ID == id {
+			existing.markExpired(true)
+			return
+		}
+	}
+	s := &Session{ID: id, Name: name, Cookie: cookie, Created: time.Now()}
+	s.expired.Store(true)
+	p.sessions = append(p.sessions, s)
 }
 
 // Remove drops a session by id.
@@ -189,6 +221,7 @@ func (s *Session) view() SessionView {
 		Active:  atomic.LoadInt64(&s.active),
 		Created: s.Created,
 		Quota:   s.Quota,
+		Expired: s.Expired(),
 	}
 }
 
@@ -217,8 +250,12 @@ func (p *Pool) SetSessionModel(ctx context.Context, id, model string) (string, e
 	s.SwitchMu.Lock()
 	defer s.SwitchMu.Unlock()
 	if err := p.up.SetModel(ctx, s.Cookie, resolved); err != nil {
+		if errors.Is(err, elmcore.ErrSessionExpired) {
+			s.markExpired(true)
+		}
 		return "", err
 	}
+	s.markExpired(false)
 	s.setModel(resolved)
 	return resolved, nil
 }
@@ -241,9 +278,13 @@ func (p *Pool) Models(ctx context.Context) ([]elmcore.Model, error) {
 	for _, s := range sessions {
 		models, err := p.up.Models(ctx, s.Cookie)
 		if err != nil {
+			if errors.Is(err, elmcore.ErrSessionExpired) {
+				s.markExpired(true)
+			}
 			lastErr = err
 			continue
 		}
+		s.markExpired(false)
 		p.modelsMu.Lock()
 		p.models = append([]elmcore.Model(nil), models...)
 		p.modelsAt = time.Now()
@@ -408,6 +449,9 @@ func (p *Pool) Chat(ctx context.Context, model, prompt string, onDelta func(elmc
 
 	chatID, err := p.up.ChatID(ctx, s.Cookie)
 	if err != nil {
+		if errors.Is(err, elmcore.ErrSessionExpired) {
+			s.markExpired(true)
+		}
 		return err
 	}
 
@@ -428,8 +472,15 @@ func (p *Pool) Chat(ctx context.Context, model, prompt string, onDelta func(elmc
 		return onDelta(kind, text)
 	})
 	unlock()
-	if err == nil && strings.TrimSpace(model) != "" && s.Model() != model {
+	if err != nil {
+		if errors.Is(err, elmcore.ErrSessionExpired) {
+			s.markExpired(true)
+		}
+		return err
+	}
+	s.markExpired(false)
+	if strings.TrimSpace(model) != "" && s.Model() != model {
 		s.setModel(model)
 	}
-	return err
+	return nil
 }

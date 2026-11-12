@@ -44,11 +44,12 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   "max_concurrency": 4,
   "queue_wait_seconds": 30,
   "api_keys": [],
-  "model_list_ttl_seconds": 300
+  "model_list_ttl_seconds": 300,
+  "check_interval_seconds": 300
 }
 ```
 
-环境变量：`ELM_SESSION`（多个用逗号分隔）、`ELM_LISTEN`、`ELM_BASE_URL`、`ELM_MODEL`、`ELM_MAX_CONCURRENCY`、`ELM_API_KEYS`、`ELM_CONFIG`。
+环境变量：`ELM_SESSION`（多个用逗号分隔）、`ELM_LISTEN`、`ELM_BASE_URL`、`ELM_MODEL`、`ELM_MAX_CONCURRENCY`、`ELM_API_KEYS`、`ELM_CHECK_INTERVAL`、`ELM_CONFIG`。
 
 - `sessions`：可以放多个 `SESSION` cookie（同一账号多次登录或不同账号），池会按负载选择，并在切换模型时优先选已在目标模型上的会话。
 - `api_keys`：非空时 `/v1/*` 需要 `Authorization: Bearer <key>`（或 `?key=`），适合把服务暴露到局域网/公网时保护。
@@ -78,14 +79,36 @@ ELM 的模型是**会话级设置**（`PUT /api/settings` 的 `model`），聊�
 - 想彻底避免互相影响：为不同模型各配一个 `SESSION` cookie（同一账号多次登录即可），池会优先把请求路由到已在该模型的会话。
 - 切换会同步影响用同一 cookie 的网页端当前模型；本服务在测试结束会切回原模型。
 
-## 6. 限制
+## 6. cookie 过期与重新登录（shell 会明确提示）
+
+ELM 的 `SESSION` cookie 会过期（登出、服务端会话到期、改密码等）。服务不会静默失败，而是在**终端日志**里直接给出处理方式，并在接口/页面里同步提示：
+
+```text
+2026/11/12 23:51:11 elm2api: ⚠ ELM SESSION cookie 已过期/失效（会话 "main"，you@ed.ac.uk）
+2026/11/12 23:51:11 elm2api: 获取/更新 ELM SESSION cookie：浏览器登录 https://elm.edina.ac.uk/elm → F12 →
+  Application(应用) → Cookies → elm.edina.ac.uk → 复制 SESSION 的值；然后二选一：
+  (a) 写进 config.json 的 sessions[].cookie（或设置环境变量 ELM_SESSION）后重启服务；
+  (b) 不重启：curl -X POST http://127.0.0.1:8787/api/sessions -H 'Content-Type: application/json' \
+      -d '{"name":"main","cookie":"SESSION=..."}'
+2026/11/12 23:51:11 elm2api: 服务仍在 http://127.0.0.1:8787 运行，修复 cookie 后无需重启（方式 b）
+```
+
+行为细节：
+
+- **启动时**：cookie 失效不会让进程退出，服务照常监听；日志打印上面这段提示，并把该会话标记为"已过期"（网页上显示红条）。
+- **请求时**：`/v1/*` 返回 HTTP 401，错误体为 `code = elm_session_expired`，并附 `hint` 字段（就是上面的更新步骤）；不会让客户端误以为在重试真流量。
+- **自动巡检**：`check_interval_seconds`（默认 300 秒，0 关闭）会定期用 `/api/open/is-logged-in` 复验 cookie；一旦失效立刻在 shell 打印提示，恢复后打印"✔ 已恢复"。
+- **重新登录无需重启**：`POST /api/sessions` 传入新 cookie 即生效；旧会话条目可 `DELETE /api/sessions/{id}` 移除。
+- `GET /api/status` 的 `warnings` 字段和网页首页红条会同步展示过期会话。
+
+## 7. 限制
 
 - 只支持纯文本对话；`tools`/`tool_choice`、文件上传、图片输入未实现（ELM 网页接口可以扩展，但当前版本未做）。
 - 非 Hosted 模型（Claude/GPT/Gemini 等）会消耗 ELM 个人预算；Web Search 等工具费用同样计入。
 - cookie 即账号凭证，等同于密码；不要提交仓库或发到聊天里。
 - 并发上限受 ELM 后端实际承载影响，建议从 2–4 开始压测。
 
-## 7. 构建与分发
+## 8. 构建与分发
 
 ```bash
 go build -o elm2api ./cmd/elm2api          # Go 1.26

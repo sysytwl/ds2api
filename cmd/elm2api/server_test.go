@@ -17,6 +17,7 @@ import (
 type fakeUpstream struct {
 	mu           sync.Mutex
 	loggedIn     bool
+	expired      bool
 	models       []elmcore.Model
 	chatCalls    int
 	active       int
@@ -29,7 +30,12 @@ type fakeUpstream struct {
 	failChat     error
 }
 
-func (f *fakeUpstream) IsLoggedIn(context.Context, string) (bool, error) { return f.loggedIn, nil }
+func (f *fakeUpstream) IsLoggedIn(context.Context, string) (bool, error) {
+	if f.expired {
+		return false, elmcore.ErrSessionExpired
+	}
+	return f.loggedIn, nil
+}
 func (f *fakeUpstream) User(context.Context, string) (elmcore.User, error) {
 	if f.user.Email == "" {
 		return elmcore.User{Email: "user@example.com", ResolvedID: "s1@ed.ac.uk"}, nil
@@ -68,6 +74,9 @@ func (f *fakeUpstream) StreamChat(ctx context.Context, _ string, _ string, promp
 	}()
 	if f.failChat != nil {
 		return f.failChat
+	}
+	if f.expired {
+		return elmcore.ErrSessionExpired
 	}
 	if f.delay > 0 {
 		select {

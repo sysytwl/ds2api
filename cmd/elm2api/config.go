@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -19,6 +18,7 @@ type Config struct {
 	QueueWaitSeconds int             `json:"queue_wait_seconds"`
 	APIKeys          []string        `json:"api_keys"`
 	ModelListTTL     int             `json:"model_list_ttl_seconds"`
+	CheckInterval    int             `json:"check_interval_seconds"`
 }
 
 // SessionConfig is one ELM browser session cookie.
@@ -35,6 +35,7 @@ func DefaultConfig() Config {
 		MaxConcurrency:   4,
 		QueueWaitSeconds: 30,
 		ModelListTTL:     300,
+		CheckInterval:    300,
 	}
 }
 
@@ -51,9 +52,6 @@ func loadConfig(path string) (Config, error) {
 	}
 	applyEnv(&cfg)
 	normalizeConfig(&cfg)
-	if len(cfg.Sessions) == 0 {
-		return cfg, errors.New("no ELM session configured: set sessions[].cookie in the config file or ELM_SESSION env")
-	}
 	return cfg, nil
 }
 
@@ -74,6 +72,11 @@ func applyEnv(cfg *Config) {
 	}
 	if v := strings.TrimSpace(os.Getenv("ELM_API_KEYS")); v != "" {
 		cfg.APIKeys = splitList(v)
+	}
+	if v := strings.TrimSpace(os.Getenv("ELM_CHECK_INTERVAL")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.CheckInterval = n
+		}
 	}
 	if v := strings.TrimSpace(os.Getenv("ELM_SESSION")); v != "" {
 		cfg.Sessions = []SessionConfig{}
@@ -101,6 +104,9 @@ func normalizeConfig(cfg *Config) {
 	}
 	if cfg.ModelListTTL <= 0 {
 		cfg.ModelListTTL = 300
+	}
+	if cfg.CheckInterval < 0 {
+		cfg.CheckInterval = 300
 	}
 	keys := make([]string, 0, len(cfg.APIKeys))
 	for _, key := range cfg.APIKeys {

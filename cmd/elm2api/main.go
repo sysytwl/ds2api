@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -34,7 +35,12 @@ func main() {
 	for _, session := range sessions {
 		view, addErr := pool.Add(ctx, session.Name, session.Cookie)
 		if addErr != nil {
-			log.Printf("elm2api: session %q ignored: %v", session.Name, addErr)
+			if errors.Is(addErr, elmcore.ErrSessionExpired) {
+				logExpired(session.Name, "", cfg.Listen)
+			} else {
+				log.Printf("elm2api: session %q ignored: %v", session.Name, addErr)
+			}
+			pool.addExpired(session.Name, session.Cookie)
 			continue
 		}
 		log.Printf("elm2api: logged in %s (%s) model=%s", view.ID, view.Email, view.Model)
@@ -44,8 +50,12 @@ func main() {
 	}
 	cancel()
 	if len(pool.Views()) == 0 {
-		log.Fatal("elm2api: no usable ELM session; check the SESSION cookie")
+		logNoSession(cfg.Listen, cfg.BaseURL)
 	}
+
+	watchCtx, watchCancel := context.WithCancel(context.Background())
+	defer watchCancel()
+	startSessionWatchdog(watchCtx, upstream, pool, time.Duration(cfg.CheckInterval)*time.Second, cfg.Listen)
 
 	server := &http.Server{
 		Addr:              cfg.Listen,
@@ -66,4 +76,47 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	_ = server.Shutdown(shutdownCtx)
+}
+
+// startSessionWatchdog periodically revalidates every cookie so an expired
+// session is reported in the shell even when no request arrives.
+func startSessionWatchdog(ctx context.Context, up Upstream, pool *Pool, interval time.Duration, listen string) {
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				checkSessions(ctx, up, pool, listen)
+			}
+		}
+	}()
+}
+
+func checkSessions(ctx context.Context, up Upstream, pool *Pool, listen string) {
+	for _, s := range pool.snapshotSessions() {
+		reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		_, err := up.IsLoggedIn(reqCtx, s.Cookie)
+		cancel()
+		if err == nil {
+			if s.Expired() {
+				s.markExpired(false)
+				logRecovered(s.Name, s.User.Email)
+			}
+			continue
+		}
+		if errors.Is(err, elmcore.ErrSessionExpired) {
+			if !s.Expired() {
+				s.markExpired(true)
+				logExpired(s.Name, s.User.Email, listen)
+			}
+			continue
+		}
+		log.Printf("elm2api: session %q revalidation failed (will retry): %v", s.Name, err)
+	}
 }

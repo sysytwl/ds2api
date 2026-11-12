@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html/template"
 	"io"
 	"log"
@@ -107,6 +108,61 @@ func logRequests(next http.Handler) http.Handler {
 	})
 }
 
+// writeUpstreamError renders an actionable error for the client, including the
+// cookie-renewal hint when the ELM session is gone.
+func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
+	status := http.StatusBadGateway
+	code := "upstream_error"
+	payload := errorPayload(err.Error(), code)
+	switch {
+	case errors.Is(err, elmcore.ErrSessionExpired):
+		status = http.StatusUnauthorized
+		code = "elm_session_expired"
+		payload = errorPayload(err.Error(), code)
+		payload["hint"] = cookieHelp
+		s.logExpiredSessions()
+	case errors.Is(err, ErrNoSession):
+		status = http.StatusServiceUnavailable
+		code = "elm_session_missing"
+		payload = errorPayload(err.Error(), code)
+		payload["hint"] = cookieHelp
+	case errors.Is(err, ErrBusy):
+		status = http.StatusTooManyRequests
+		payload = errorPayload(err.Error(), "busy")
+	}
+	writeJSON(w, status, payload)
+}
+
+func (s *Server) logExpiredSessions() {
+	for _, view := range s.pool.Views() {
+		if view.Expired {
+			logExpired(view.Name, view.Email, s.cfg.Listen)
+		}
+	}
+}
+
+func (s *Server) warnings() []string {
+	views := s.pool.Views()
+	out := []string{}
+	expired := 0
+	for _, view := range views {
+		if view.Expired {
+			expired++
+			label := view.Name
+			if strings.TrimSpace(view.Email) != "" {
+				label += "（" + view.Email + "）"
+			}
+			out = append(out, fmt.Sprintf("会话 %q 的 ELM SESSION cookie 已过期/失效，请更新 cookie", label))
+		}
+	}
+	if len(views) == 0 {
+		out = append(out, "当前没有已登录的 ELM 会话，请用 SESSION cookie 登录")
+	} else if expired == len(views) {
+		out = append(out, "所有 ELM 会话都已失效，服务会在 cookie 更新前拒绝请求")
+	}
+	return out
+}
+
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -118,7 +174,7 @@ func timeNowUnix() int64 { return time.Now().Unix() }
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	models, err := s.pool.ModelsForOpenAI(r.Context())
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, errorPayload(err.Error(), "upstream_error"))
+		s.writeUpstreamError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
@@ -128,7 +184,7 @@ func (s *Server) handleModelByID(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	models, err := s.pool.ModelsForOpenAI(r.Context())
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, errorPayload(err.Error(), "upstream_error"))
+		s.writeUpstreamError(w, err)
 		return
 	}
 	for _, model := range models {
@@ -153,7 +209,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	resolved, err := s.pool.ResolveModel(r.Context(), req.Model)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorPayload(err.Error(), "model_not_found"))
+		if errors.Is(err, ErrModelNotFound) {
+			writeJSON(w, http.StatusBadRequest, errorPayload(err.Error(), "model_not_found"))
+		} else {
+			s.writeUpstreamError(w, err)
+		}
 		return
 	}
 	prompt, err := buildPrompt(req.Messages)
@@ -181,7 +241,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, errorPayload(err.Error(), "upstream_error"))
+		s.writeUpstreamError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, completionPayload(id, displayModel, content.String(), thinking.String()))
@@ -218,7 +278,13 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, id, di
 	if err != nil {
 		if r.Context().Err() == nil {
 			log.Printf("stream chat failed: %v", err)
-			_ = emit(errorPayload(err.Error(), "upstream_error"))
+			payload := errorPayload(err.Error(), "upstream_error")
+			if errors.Is(err, elmcore.ErrSessionExpired) {
+				payload = errorPayload(err.Error(), "elm_session_expired")
+				payload["hint"] = cookieHelp
+				s.logExpiredSessions()
+			}
+			_ = emit(payload)
 		}
 		return
 	}
@@ -238,6 +304,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		},
 		"sessions": s.pool.Views(),
 		"models":   len(models),
+		"warnings": s.warnings(),
 	})
 }
 
@@ -256,11 +323,14 @@ func (s *Server) handleAddSession(w http.ResponseWriter, r *http.Request) {
 	}
 	view, err := s.pool.Add(r.Context(), req.Name, req.Cookie)
 	if err != nil {
-		status := http.StatusBadRequest
-		if errors.Is(err, elmcore.ErrNotLoggedIn) {
-			status = http.StatusUnauthorized
+		if errors.Is(err, elmcore.ErrSessionExpired) {
+			logExpired(strings.TrimSpace(req.Name), "", s.cfg.Listen)
+			payload := errorPayload(err.Error(), "elm_session_expired")
+			payload["hint"] = cookieHelp
+			writeJSON(w, http.StatusUnauthorized, payload)
+			return
 		}
-		writeJSON(w, status, errorPayload(err.Error(), "login_failed"))
+		writeJSON(w, http.StatusBadRequest, errorPayload(err.Error(), "login_failed"))
 		return
 	}
 	writeJSON(w, http.StatusCreated, view)
@@ -284,6 +354,10 @@ func (s *Server) handleSwitchModel(w http.ResponseWriter, r *http.Request) {
 	}
 	model, err := s.pool.SetSessionModel(r.Context(), r.PathValue("id"), req.Model)
 	if err != nil {
+		if errors.Is(err, elmcore.ErrSessionExpired) {
+			s.writeUpstreamError(w, err)
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, errorPayload(err.Error(), "switch_failed"))
 		return
 	}
@@ -293,7 +367,7 @@ func (s *Server) handleSwitchModel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRefreshModels(w http.ResponseWriter, r *http.Request) {
 	models, err := s.pool.RefreshModels(r.Context())
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, errorPayload(err.Error(), "upstream_error"))
+		s.writeUpstreamError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": len(models)})
@@ -314,6 +388,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"BaseURL":    s.cfg.BaseURL,
 		"KeyQuery":   keyQuery(r),
 		"HasAPIKeys": len(s.keys) > 0,
+		"Warnings":   s.warnings(),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.tmpl.Execute(w, data); err != nil {
@@ -383,10 +458,13 @@ button { background: #2b6cb0; color: #fff; border: 0; border-radius: 6px; paddin
 button.secondary { background: #33465e; }
 .muted { color: #8aa0b8; font-size: 12px; }
 .card { background: #18202b; border: 1px solid #263040; border-radius: 10px; padding: 14px; margin: 10px 0; }
+.warn { background: #3a1d1d; border-color: #a33; }
+.expired { color: #ff8a8a; font-weight: 600; }
 </style>
 </head>
 <body>
 <h1>ELM 网页版 → OpenAI API</h1>
+{{range .Warnings}}<div class="card warn">⚠ {{.}}</div>{{end}}
 <div class="card">
   <div class="muted">监听 <code>{{.BaseURL}}</code> 的上游 · 并发上限 <b>{{.MaxConc}}</b>（当前占用 {{.InUse}}）· 默认模型 <code>{{.Default}}</code></div>
   <div class="muted">OpenAI 客户端：<code>base_url = http://127.0.0.1:8787/v1</code>{{if .HasAPIKeys}}，<code>api_key</code> = 配置里的 key{{end}}</div>
@@ -399,7 +477,7 @@ button.secondary { background: #33465e; }
 {{range .Sessions}}
 {{$sess := .}}
 <tr>
-  <td>{{.Name}}<div class="muted">{{.ID}}</div></td>
+  <td>{{.Name}}{{if .Expired}} <span class="expired">（cookie 已过期）</span>{{end}}<div class="muted">{{.ID}}</div></td>
   <td>{{.Email}}</td>
   <td><code>{{.Model}}</code></td>
   <td>{{.Active}}</td>
