@@ -1,4 +1,4 @@
-package elmweb
+package elmcore
 
 import (
 	"bufio"

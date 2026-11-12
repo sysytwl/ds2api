@@ -19,6 +19,7 @@
 - [DS2API 项目价值说明](./project-value.md)
 - [API -> 网页对话纯文本兼容主链路说明](./prompt-compatibility.md)
 - [ELM Web 上游（网页对话转 API）](./ELM.md)
+- [elm2api：独立二进制，把 ELM 网页版转成本地 OpenAI API](./ELM2API.md)
 - [Tool Calling 统一语义](./toolcall-semantics.md)
 - [DeepSeek SSE 行为结构说明（逆向观察）](./DeepSeekSSE行为结构说明-2026-04-05.md)
 
@@ -52,6 +53,7 @@ Recommended reading order:
 - [DS2API project value note](./project-value.md)
 - [API -> pure-text web-chat compatibility pipeline](./prompt-compatibility.md)
 - [ELM web upstream (web chat to API)](./ELM.md)
+- [elm2api: standalone binary exposing the ELM web chat as a local OpenAI API](./ELM2API.md)
 - [Tool-calling unified semantics](./toolcall-semantics.md)
 - [DeepSeek SSE behavior notes (reverse-engineered)](./DeepSeekSSE行为结构说明-2026-04-05.md)
 
