@@ -48,6 +48,12 @@ func (c Config) MarshalJSON() ([]byte, error) {
 	if c.ThinkingInjection.Enabled != nil || strings.TrimSpace(c.ThinkingInjection.Prompt) != "" {
 		m["thinking_injection"] = c.ThinkingInjection
 	}
+	if strings.TrimSpace(c.Upstream) != "" {
+		m["upstream"] = c.Upstream
+	}
+	if strings.TrimSpace(c.Elm.BaseURL) != "" || strings.TrimSpace(c.Elm.Model) != "" {
+		m["elm"] = NormalizeElmConfig(c.Elm)
+	}
 	if strings.TrimSpace(c.Vercel.Token) != "" || strings.TrimSpace(c.Vercel.ProjectID) != "" || strings.TrimSpace(c.Vercel.TeamID) != "" {
 		m["vercel"] = NormalizeVercelConfig(c.Vercel)
 	}
@@ -128,6 +134,14 @@ func (c *Config) UnmarshalJSON(b []byte) error {
 			if err := json.Unmarshal(v, &c.ThinkingInjection); err != nil {
 				return fmt.Errorf("invalid field %q: %w", k, err)
 			}
+		case "upstream":
+			if err := json.Unmarshal(v, &c.Upstream); err != nil {
+				return fmt.Errorf("invalid field %q: %w", k, err)
+			}
+		case "elm":
+			if err := json.Unmarshal(v, &c.Elm); err != nil {
+				return fmt.Errorf("invalid field %q: %w", k, err)
+			}
 		case "vercel":
 			if err := json.Unmarshal(v, &c.Vercel); err != nil {
 				return fmt.Errorf("invalid field %q: %w", k, err)
@@ -171,6 +185,8 @@ func (c Config) Clone() Config {
 			Enabled: cloneBoolPtr(c.ThinkingInjection.Enabled),
 			Prompt:  c.ThinkingInjection.Prompt,
 		},
+		Upstream:         c.Upstream,
+		Elm:              c.Elm,
 		Vercel:           c.Vercel,
 		VercelSyncHash:   c.VercelSyncHash,
 		VercelSyncTime:   c.VercelSyncTime,

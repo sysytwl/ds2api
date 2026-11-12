@@ -20,6 +20,8 @@ type Config struct {
 	AutoDelete        AutoDeleteConfig        `json:"auto_delete"`
 	CurrentInputFile  CurrentInputFileConfig  `json:"current_input_file,omitempty"`
 	ThinkingInjection ThinkingInjectionConfig `json:"thinking_injection,omitempty"`
+	Upstream          string                  `json:"upstream,omitempty"`
+	Elm               ElmConfig               `json:"elm,omitempty"`
 	Vercel            VercelConfig            `json:"vercel,omitempty"`
 	VercelSyncHash    string                  `json:"_vercel_sync_hash,omitempty"`
 	VercelSyncTime    int64                   `json:"_vercel_sync_time,omitempty"`
@@ -34,6 +36,22 @@ type Account struct {
 	Password string `json:"password,omitempty"`
 	Token    string `json:"token,omitempty"`
 	ProxyID  string `json:"proxy_id,omitempty"`
+}
+
+// ElmConfig configures the ELM web upstream (https://elm.edina.ac.uk). The
+// web chat is driven with the browser session cookie stored on an account
+// token, and the model is the ELM model id (for example
+// "Qwen/Qwen3.5-397B-A17B-FP8").
+type ElmConfig struct {
+	BaseURL string `json:"base_url,omitempty"`
+	Model   string `json:"model,omitempty"`
+}
+
+// NormalizeElmConfig trims the ELM upstream settings.
+func NormalizeElmConfig(in ElmConfig) ElmConfig {
+	in.BaseURL = strings.TrimRight(strings.TrimSpace(in.BaseURL), "/")
+	in.Model = strings.TrimSpace(in.Model)
+	return in
 }
 
 type APIKey struct {
@@ -100,6 +118,8 @@ func (c *Config) NormalizeCredentials() {
 		c.Accounts[i].Remark = strings.TrimSpace(c.Accounts[i].Remark)
 	}
 
+	c.Upstream = strings.ToLower(strings.TrimSpace(c.Upstream))
+	c.Elm = NormalizeElmConfig(c.Elm)
 	c.Vercel = NormalizeVercelConfig(c.Vercel)
 	c.normalizeModelAliases()
 }

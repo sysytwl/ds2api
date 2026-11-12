@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -25,6 +26,9 @@ func ValidateConfig(c Config) error {
 		return err
 	}
 	if err := ValidateCurrentInputFileConfig(c.CurrentInputFile); err != nil {
+		return err
+	}
+	if err := ValidateUpstreamConfig(c.Upstream, c.Elm); err != nil {
 		return err
 	}
 	if err := ValidateAccountProxyReferences(c.Accounts, c.Proxies); err != nil {
@@ -117,6 +121,29 @@ func ValidateAutoDeleteConfig(autoDelete AutoDeleteConfig) error {
 func ValidateCurrentInputFileConfig(currentInputFile CurrentInputFileConfig) error {
 	if currentInputFile.MinChars != 0 {
 		return ValidateIntRange("current_input_file.min_chars", currentInputFile.MinChars, 1, 100000000, true)
+	}
+	return nil
+}
+
+// ValidateUpstreamConfig checks the upstream selector and ELM settings.
+func ValidateUpstreamConfig(upstream string, elm ElmConfig) error {
+	mode := strings.ToLower(strings.TrimSpace(upstream))
+	switch mode {
+	case "", "deepseek", "elm":
+	default:
+		return fmt.Errorf("upstream must be one of deepseek, elm")
+	}
+	if mode != "elm" {
+		return nil
+	}
+	if base := strings.TrimSpace(elm.BaseURL); base != "" {
+		u, err := url.Parse(base)
+		if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+			return fmt.Errorf("elm.base_url must be an absolute http(s) URL")
+		}
+	}
+	if model := strings.TrimSpace(elm.Model); strings.ContainsAny(model, "\r\n") {
+		return fmt.Errorf("elm.model must be a single line")
 	}
 	return nil
 }

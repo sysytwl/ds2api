@@ -33,6 +33,10 @@ ds2api/
 │   │   ├── client/                       # Login/session/completion/upload/delete calls
 │   │   ├── protocol/                     # DeepSeek URLs, constants, skip path/pattern
 │   │   └── transport/                    # DeepSeek transport details
+│   ├── elmweb/                           # ELM web upstream (STOMP/WebSocket + SESSION cookie)
+│   │   ├── ws.go                         # Self-contained RFC 6455 WebSocket client
+│   │   ├── stomp.go                      # STOMP frames and ELM chat event parsing
+│   │   └── client.go                     # ELM REST + chat stream; implements DeepSeekCaller
 │   ├── devcapture/                       # Dev capture and troubleshooting
 │   ├── format/                           # Response formatting layer
 │   │   ├── claude/                       # Claude output formatting

@@ -54,6 +54,12 @@
     "enabled": true,
     "prompt": ""
   },
+  "upstream": "deepseek",
+  "elm": {
+    "_comment": "upstream 设为 elm 时生效：用 ELM 网页版（需 accounts[].token 填 SESSION cookie）转成 API",
+    "base_url": "https://elm.edina.ac.uk",
+    "model": "Qwen/Qwen3.5-397B-A17B-FP8"
+  },
   "embeddings": {
     "provider": "deterministic"
   },

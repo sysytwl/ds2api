@@ -21,6 +21,35 @@ func (s *Store) ModelAliases() map[string]string {
 	return out
 }
 
+// Upstream reports which web upstream serves completions: "deepseek"
+// (default) or "elm".
+func (s *Store) Upstream() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	mode := strings.ToLower(strings.TrimSpace(s.cfg.Upstream))
+	if mode == "" {
+		return "deepseek"
+	}
+	return mode
+}
+
+// ElmBaseURL is the ELM deployment base URL.
+func (s *Store) ElmBaseURL() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if url := strings.TrimSpace(s.cfg.Elm.BaseURL); url != "" {
+		return url
+	}
+	return "https://elm.edina.ac.uk"
+}
+
+// ElmModel is the ELM web chat model id the bridge selects before each chat.
+func (s *Store) ElmModel() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return strings.TrimSpace(s.cfg.Elm.Model)
+}
+
 func (s *Store) ToolcallMode() string {
 	return "feature_match"
 }

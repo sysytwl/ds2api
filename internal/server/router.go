@@ -20,7 +20,9 @@ import (
 	"ds2api/internal/chathistory"
 	"ds2api/internal/config"
 	dsclient "ds2api/internal/deepseek/client"
+	"ds2api/internal/elmweb"
 	"ds2api/internal/httpapi/admin"
+	adminshared "ds2api/internal/httpapi/admin/shared"
 	"ds2api/internal/httpapi/claude"
 	"ds2api/internal/httpapi/gemini"
 	"ds2api/internal/httpapi/ollama"
@@ -37,7 +39,7 @@ type App struct {
 	Store    *config.Store
 	Pool     *account.Pool
 	Resolver *auth.Resolver
-	DS       *dsclient.Client
+	DS       shared.DeepSeekCaller
 	Router   http.Handler
 }
 
@@ -48,14 +50,32 @@ func NewApp() (*App, error) {
 	}
 	pool := account.NewPool(store)
 	var dsClient *dsclient.Client
+	var elmClient *elmweb.Client
 	resolver := auth.NewResolver(store, pool, func(ctx context.Context, acc config.Account) (string, error) {
+		if elmClient != nil {
+			return elmClient.Login(ctx, acc)
+		}
 		return dsClient.Login(ctx, acc)
 	})
-	dsClient = dsclient.NewClient(store, resolver)
-	if err := dsClient.PreloadPow(context.Background()); err != nil {
-		config.Logger.Warn("[PoW] init failed", "error", err)
+	var upstream shared.DeepSeekCaller
+	if store.Upstream() == "elm" {
+		elmClient = elmweb.New(store)
+		upstream = elmClient
+		config.Logger.Info("[upstream] ELM web bridge enabled", "base_url", store.ElmBaseURL(), "model", store.ElmModel())
 	} else {
-		config.Logger.Info("[PoW] pure Go solver ready")
+		dsClient = dsclient.NewClient(store, resolver)
+		if err := dsClient.PreloadPow(context.Background()); err != nil {
+			config.Logger.Warn("[PoW] init failed", "error", err)
+		} else {
+			config.Logger.Info("[PoW] pure Go solver ready")
+		}
+		upstream = dsClient
+	}
+	var adminUpstream adminshared.DeepSeekCaller
+	if elmClient != nil {
+		adminUpstream = elmClient
+	} else {
+		adminUpstream = dsClient
 	}
 	chatHistoryStore := chathistory.New(config.ChatHistoryPath())
 	if err := chatHistoryStore.Err(); err != nil {
@@ -63,13 +83,13 @@ func NewApp() (*App, error) {
 	}
 
 	modelsHandler := &shared.ModelsHandler{Store: store}
-	chatHandler := &chat.Handler{Store: store, Auth: resolver, DS: dsClient, ChatHistory: chatHistoryStore}
-	responsesHandler := &responses.Handler{Store: store, Auth: resolver, DS: dsClient, ChatHistory: chatHistoryStore}
-	filesHandler := &files.Handler{Store: store, Auth: resolver, DS: dsClient, ChatHistory: chatHistoryStore}
-	embeddingsHandler := &embeddings.Handler{Store: store, Auth: resolver, DS: dsClient, ChatHistory: chatHistoryStore}
-	claudeHandler := &claude.Handler{Store: store, Auth: resolver, DS: dsClient, OpenAI: chatHandler, ChatHistory: chatHistoryStore}
-	geminiHandler := &gemini.Handler{Store: store, Auth: resolver, DS: dsClient, OpenAI: chatHandler, ChatHistory: chatHistoryStore}
-	adminHandler := &admin.Handler{Store: store, Pool: pool, DS: dsClient, OpenAI: chatHandler, ChatHistory: chatHistoryStore}
+	chatHandler := &chat.Handler{Store: store, Auth: resolver, DS: upstream, ChatHistory: chatHistoryStore}
+	responsesHandler := &responses.Handler{Store: store, Auth: resolver, DS: upstream, ChatHistory: chatHistoryStore}
+	filesHandler := &files.Handler{Store: store, Auth: resolver, DS: upstream, ChatHistory: chatHistoryStore}
+	embeddingsHandler := &embeddings.Handler{Store: store, Auth: resolver, DS: upstream, ChatHistory: chatHistoryStore}
+	claudeHandler := &claude.Handler{Store: store, Auth: resolver, DS: upstream, OpenAI: chatHandler, ChatHistory: chatHistoryStore}
+	geminiHandler := &gemini.Handler{Store: store, Auth: resolver, DS: upstream, OpenAI: chatHandler, ChatHistory: chatHistoryStore}
+	adminHandler := &admin.Handler{Store: store, Pool: pool, DS: adminUpstream, OpenAI: chatHandler, ChatHistory: chatHistoryStore}
 	ollamaHandler := &ollama.Handler{Store: store}
 	webuiHandler := webui.NewHandler()
 
@@ -127,7 +147,7 @@ func NewApp() (*App, error) {
 		http.NotFound(w, req)
 	})
 
-	return &App{Store: store, Pool: pool, Resolver: resolver, DS: dsClient, Router: r}, nil
+	return &App{Store: store, Pool: pool, Resolver: resolver, DS: upstream, Router: r}, nil
 }
 
 func timeout(d time.Duration) func(http.Handler) http.Handler {

@@ -33,6 +33,10 @@ ds2api/
 │   │   ├── client/                       # 登录、会话、completion、上传/删除等上游调用
 │   │   ├── protocol/                     # DeepSeek URL、常量、skip path/pattern
 │   │   └── transport/                    # DeepSeek 传输层细节
+│   ├── elmweb/                           # ELM Web 上游（STOMP/WebSocket + SESSION cookie）
+│   │   ├── ws.go                         # 自研 RFC6455 WebSocket 客户端
+│   │   ├── stomp.go                      # STOMP 帧与 ELM 聊天事件解析
+│   │   └── client.go                     # ELM REST + 聊天流，实现 DeepSeekCaller 接口
 │   ├── devcapture/                       # 开发抓包与调试采集
 │   ├── format/                           # 响应格式化层
 │   │   ├── claude/                       # Claude 输出格式化
