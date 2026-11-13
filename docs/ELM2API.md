@@ -10,9 +10,11 @@
 - **cookie 登录**：启动时配置 cookie，或运行中通过 `POST /api/sessions` 追加；也可在网页界面粘贴 cookie 登录。
 - **显示网页端全部模型**：`GET /v1/models`（以及 `/` 网页表格）列出 ELM 网页里所有模型（31 个，含 Qwen/Llama/Mistral/GPT/Claude/Gemini 等），带名称、来源、上下文长度、是否免费。
 - **按请求切换模型**：`/v1/chat/completions` 的 `model` 可以是任意 ELM 模型 id，也支持名称/简写（如 `Qwen 3.5 397B`、`qwen-3.5`、`llama-3.3`）；也可通过 `PUT /api/sessions/{id}/model` 给某个会话固定模型。
-- **并发**：全局并发上限（默认 4）由信号量控制；同一模型可真正并行；不同模型只在"切模型 → 提交提问 → 收到首个增量"这一小段串行，实测 3 路并行 3 条回答 1.45s 完成。
+- **并发**：`max_concurrency`（默认 4）是服务总并发上限；但**一个 ELM 账号同一时刻只能跑一个聊天**（网页端本身如此，第二个对话要等第一个结束），所以同一 cookie 的请求会在服务内排队，不同 cookie（不同账号）才真正并行。
 - **流式/非流式**：`stream:true` 输出标准 SSE（含 `[DONE]`），thinking 内容以 `reasoning_content` 增量输出；`stream:false` 聚合返回。
-- **对话连续、聊天可追溯**：同一个 session 复用同一个 ELM chat，上下文由 ELM 网页端的历史承担（网页里能直接看到每次 API 对话）。只有**换模型**、**换 session（不同 cookie）** 或**开始一段新对话**时才新建 chat（`GET /api/new-chat`）；chat id 记录在 `state_file` 里，重启或切回 session 都能接着聊。
+- **对话连续、聊天可追溯**：把网页聊天当上下文存储——每段对话对应一个 ELM chat，续聊时只把**新增的那一轮**发给 ELM，网页里能直接看到每次 API 对话。换模型**不**新建 chat（ELM 的模型是会话级设置）；只有客户端重发的内容对不上任何已知对话（编辑/回滚/换话题）或换 session 时才新建 chat。
+- **可同时保留多段对话**：一个 session 记住最近 8 个 chat（主对话、subagent 等），谁续聊就回到谁的 chat，不会串台。
+- **Responses API**：`POST /v1/responses` 支持 `previous_response_id`——响应 id 映射到 ELM chat，客户端只发新增输入即可继续；id 失效（网页里删了 chat、state 被重置）自动新建 chat；`store:false` 暂不支持续聊，按“每次新建 chat”处理。
 
 ## 2. 快速开始
 
@@ -28,6 +30,12 @@ curl http://127.0.0.1:8787/v1/models
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"Qwen/Qwen3.5-397B-A17B-FP8","messages":[{"role":"user","content":"hello"}],"stream":true}'
+
+# 4) Responses API（推荐给 agent：只发新增输入，历史留在 ELM 网页端）
+curl http://127.0.0.1:8787/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen-3.5","input":"hello"}'
+# 返回里的 id（resp_...）下次当作 previous_response_id 传回来，即可继续同一段对话
 ```
 
 浏览器打开 <http://127.0.0.1:8787> 可以看到：已登录会话、预算、当前模型、全部模型列表，并可粘贴 cookie 登录/切换模型。
@@ -56,11 +64,11 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 环境变量：`ELM_SESSION`（多个用逗号分隔）、`ELM_LISTEN`、`ELM_BASE_URL`、`ELM_MODEL`、`ELM_MAX_CONCURRENCY`、`ELM_API_KEYS`、`ELM_CHECK_INTERVAL`、`ELM_STATE_FILE`、`ELM_CONFIG`。
 
-- `state_file`：记录每个 session 的 chat id、当前模型和上一轮 prompt；重启后或切回某个 session 时能接着原来的 ELM 聊天（留空则不落盘）。
+- `state_file`：记录每个 session 记住的 chat（id、模型、上一轮 prompt 的长度与 sha256、120 字预览）以及 Responses 的 `resp_*` → chat 映射；重启后或切回某个 session 时能接着原来的 ELM 聊天（留空则不落盘）。不会写入完整 prompt。
 
-- `sessions`：可以放多个 `SESSION` cookie（同一账号多次登录或不同账号），池会按负载选择，并在切换模型时优先选已在目标模型上的会话。
+- `sessions`：可以放多个 `SESSION` cookie（不同账号时才能真正并行；同一账号通常只能拿到一个可用 cookie），池会按负载选择，并在切换模型时优先选已在目标模型上的会话。
 - `api_keys`：非空时 `/v1/*` 需要 `Authorization: Bearer <key>`（或 `?key=`），适合把服务暴露到局域网/公网时保护。
-- `max_concurrency`：同时进行的 ELM 聊天数；`queue_wait_seconds` 为排队等待上限，超过返回 429/繁忙错误。
+- `max_concurrency`：服务端总并发上限；同一 session 内部的请求由“回合锁”串行（ELM 一个账号只能跑一个聊天），排队等待只受客户端超时限制。
 
 ## 4. HTTP 接口
 
@@ -69,6 +77,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 | GET | `/v1/models` | 网页端全部模型（OpenAI 格式 + 扩展字段） |
 | GET | `/v1/models/{id}` | 单个模型 |
 | POST | `/v1/chat/completions` | OpenAI 兼容聊天，`stream` 支持 |
+| POST | `/v1/responses` | OpenAI Responses API，支持 `previous_response_id` / `instructions` / `stream` |
 | GET | `/healthz` | 健康检查 |
 | GET | `/api/status` | 会话、预算、并发、模型数量 |
 | GET/POST | `/api/sessions` | 列出 / 用 cookie 登录新会话 |
@@ -78,17 +87,32 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 管理接口（`/api/*`、`/`、`/ui/*`）只允许回环地址访问；`/v1/*` 可选 API key 保护。
 
-## 5. 模型切换的真实含义
+## 5. 模型切换与账号并发
 
 ELM 的模型是**会话级设置**（`PUT /api/settings` 的 `model`），聊天请求里只带提示词。因此：
 
-- 单会话里不同模型的请求会在"切换模型 → 提交 → 收到首个 token"之间串行（拿到首个增量后即释放锁，实测不影响在途回答的模型）。
-- 想彻底避免互相影响：为不同模型各配一个 `SESSION` cookie（同一账号多次登录即可），池会优先把请求路由到已在该模型的会话。
-- 切换会同步影响用同一 cookie 的网页端当前模型；本服务在测试结束会切回原模型。
-- 同一 session + 同一模型复用同一个 ELM chat：如果本次 prompt 是上一轮 prompt 的延长（OpenAI 客户端通常把完整历史重新发一遍），服务只把**新增的那一轮**发给 ELM，避免上下文重复；不是延续（另一段对话）或换了模型时才新建 chat。
+- 请求里换 `model` 只是调一次设置接口，**继续同一个 chat**，上下文不丢（ELM 网页端的模型选择器也是这个行为）。
+- **一个账号同一时刻只能跑一个聊天**：第二个对话会等第一个结束。服务用每个 session 的“回合锁”把并发请求排队（日志打印 `queueing request`），而不是让两个回答在同一个网页聊天里交错。
+- `max_concurrency` 只在配了多个账号 cookie 时才有意义；单 cookie 时实际并发恒为 1。想真正并行只能配多个账号（同一账号重复登录拿不到第二个可用 cookie）。
+- 切换会同步影响用同一 cookie 的网页端当前模型。
 - 回答会出现在 ELM 网页端的聊天记录里，这是"用网页聊天伪装成 API"的正常现象，也方便回看/审计。
 
-## 6. cookie 过期与重新登录（shell 会明确提示）
+## 6. 对话是怎么复用的（chat 规则）
+
+服务记的是每段对话**最后一次发给 ELM 的 prompt 长度 + sha256**（不存原文），据此判断新请求属于哪段对话：
+
+| 情况 | 行为 |
+|---|---|
+| 新 prompt 以上次 prompt 开头且更长（OpenAI 客户端通常重发完整历史） | 复用该 chat，只发多出来的那一轮 |
+| prompt 与上次完全相同（客户端重试空回复） | 复用该 chat，原样重发；网页里会多一条相同的提问，但上下文保住了 |
+| prompt 对不上任何已知对话（编辑、回滚、换话题） | 新建 chat（网页聊天无法回滚，宁可重开也不串台） |
+| 换模型 | **不**新建 chat，继续当前对话 |
+| 换 session | 各 session 有各自的 chat 记录，切回来还能接上 |
+| 同一 session 有多段对话（subagent、第二个窗口） | 按“最长前缀匹配”回到各自的 chat，最多记 8 段 |
+
+`state_file` 只保存 chat id、模型、prompt 长度/哈希和 120 字预览，重启后仍能接上原来的聊天；`GET /api/status` 与首页会列出每个 session 记住的 chat。
+
+## 7. cookie 过期与重新登录（shell 会明确提示）
 
 ELM 的 `SESSION` cookie 会过期（登出、服务端会话到期、改密码等）。服务不会静默失败，而是在**终端日志**里直接给出处理方式，并在接口/页面里同步提示：
 
@@ -110,26 +134,30 @@ ELM 的 `SESSION` cookie 会过期（登出、服务端会话到期、改密码�
 - **重新登录无需重启**：`POST /api/sessions` 传入新 cookie 即生效；旧会话条目可 `DELETE /api/sessions/{id}` 移除。
 - `GET /api/status` 的 `warnings` 字段和网页首页红条会同步展示过期会话。
 
-## 7. 限制
+## 8. 限制
 
-- 只支持纯文本对话；`tools`/`tool_choice`、文件上传、图片输入未实现（ELM 网页接口可以扩展，但当前版本未做）。
+- 只支持纯文本对话；`tools`/`tool_choice`、文件上传、图片输入未实现（ELM 网页接口可以扩展，但当前版本未做）；Responses 里的 `function_call` 会被忽略。
+- **一个账号同一时刻只能跑一个聊天**：并发请求会排队，这是 ELM 侧的限制，不是本服务的开关。
+- Responses 的 `usage` 是按字符估算的（ELM 网页端不返回 token 用量）；`store:false` 不支持续聊，等价于每次新建 chat。
 - 非 Hosted 模型（Claude/GPT/Gemini 等）会消耗 ELM 个人预算；Web Search 等工具费用同样计入。
 - cookie 即账号凭证，等同于密码；不要提交仓库或发到聊天里。
-- 并发上限受 ELM 后端实际承载影响，建议从 2–4 开始压测。
 
-## 8. 排错（404 / API key / 空回复 / 串台）
+## 9. 排错（404 / API key / 空回复 / 排队）
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
 | `GET /v1/models` 返回 **404** | 客户端把 base_url 拼成了别的路径（例如 base_url 写成 `.../v1/chat/completions`，或旧版本不接受 `/models`、结尾 `/`） | 新版本同时支持 `/v1/models`、`/models` 和末尾 `/`；base_url 只写到 `http://127.0.0.1:8787` 或 `http://127.0.0.1:8787/v1`。仍 404 时响应体会直接写出收到的 `method + path` 和可用接口 |
 | `API key wrong` | 用的是 ds2api 的 `DS2API_ADMIN_KEY` 逻辑 | elm2api 默认**不校验** key；只有 `config.json` 里 `api_keys` 非空时才校验 `Authorization: Bearer <key>` |
 | `EMPTY_RESPONSE` / "completed response with no content" | ELM 网页端偶发把新 websocket 断开（日志会出现 `wsasend ... forcibly closed`），旧版本已经先发了 200 再失败，客户端只看到空内容 | 新版本：① 建立聊天流失败会自动重试 3 次；② 拿到第一个增量前不发送 SSE 头，失败时返回真正的 4xx/5xx；③ 真的空回复返回 `empty_upstream_response` + `hint`，客户端重试即可 |
-| 回答出现在浏览器打开的聊天里 | 预期行为：API 是把网页聊天伪装成 API | 同一 session 复用同一 chat，历史留在网页端可查；换模型/换 session/新对话时才自动新建 chat |
+| 回答出现在浏览器打开的聊天里 | 预期行为：API 是把网页聊天伪装成 API | 复用该对话的 chat，历史留在网页端可查；换模型不新建 chat，只有回滚/新对话/换 session 才会新建 |
+| 第二个请求很慢，或日志出现 `queueing request` | 一个 ELM 账号同一时刻只能跑一个聊天，第二个对话要等第一个结束 | 正常排队；要并行就配多个账号的 cookie |
 | 长 prompt（如 coding agent 的 system prompt）直接返回空回复 | ELM 网页端单条消息上限约 **16K 字符**，超长消息会被上游直接丢弃 | 服务会自动把过长 prompt 按行切成多条消息依次发送（同一 chat，仅最后一条的输出返回给客户端）；如果仍然失败会返回 413 `prompt_too_long` 并给出实际字符数 |
+| `previous_response_id` 失效 / 网页里把 chat 删了 | 映射记在 `state_file`，chat 被删或 state 被重置后找不到 | 自动新建 chat 并把这次当作新对话（日志打印 `previous_response_id ... is unknown`）；想接回旧上下文就重发完整历史 |
+| 请求一直被客户端取消 | ELM 网页端在长 prompt / 大历史时首字较慢，客户端超时设得太短 | 把客户端超时调到 120s 以上；`ELM_DEBUG=1` 可看到逐帧日志 |
 
 模型列表在网页端是 31 个；如果只看到 DeepSeek 模型，说明启动的是旧的 `ds2api-elm-*.exe`，不是 `elm2api`。
 
-## 9. 构建与分发
+## 10. 构建与分发
 
 ```bash
 go build -o elm2api ./cmd/elm2api          # Go 1.26
@@ -145,8 +173,8 @@ go build -ldflags="-s -w" -o elm2api ./cmd/elm2api
 
 `elm2api` is a standalone binary that turns the ELM web chat into a local OpenAI-compatible API using only an ELM `SESSION` cookie. It does **not** depend on ds2api's DeepSeek code: `cmd/elm2api` only imports `internal/elmcore` (ELM WebSocket/STOMP client).
 
-Features: cookie login (config, env, management API or the localhost page), listing every model the ELM web app offers (31 models), per-request model switching by id or friendly name, true concurrency (default limit 4), streaming SSE and non-streaming responses, plus a localhost dashboard with sessions, quota and the model table.
+Features: cookie login (config, env, management API or the localhost page), every model the ELM web app offers (31 models), per-request model switching by id or friendly name, `POST /v1/chat/completions` and `POST /v1/responses` (with `previous_response_id`), streaming SSE, and a localhost dashboard with sessions, quota, remembered chats and the model table.
 
 Run `./elm2api --config config.json` (listens on `127.0.0.1:8787`). Point any OpenAI client at `http://127.0.0.1:8787/v1`.
 
-Notes: the ELM model is a session-level setting, so different-model requests serialize only the switch/submit window; configure several cookies to keep different models fully independent. Only plain text chat is implemented (no tools, files or images). Non-hosted models consume the ELM personal budget.
+Notes: the ELM model is a session-level setting, so switching models keeps the same chat. One ELM account runs one chat at a time, so requests on the same cookie queue; configure several accounts' cookies for real parallelism. Only plain text chat is implemented (no tools, files or images). Non-hosted models consume the ELM personal budget.

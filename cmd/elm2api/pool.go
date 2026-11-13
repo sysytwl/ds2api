@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -43,25 +41,58 @@ var (
 
 // Session is one logged-in ELM browser session.
 type Session struct {
-	ID       string
-	Name     string
-	Cookie   string
-	User     elmcore.User
-	Quota    elmcore.Quota
-	Created  time.Time
-	SwitchMu sync.Mutex // held until a chat's model is fixed (first delta)
-	modelMu  sync.RWMutex
-	model    string
-	active   int64
-	expired  atomic.Bool
+	ID      string
+	Name    string
+	Cookie  string
+	User    elmcore.User
+	Quota   elmcore.Quota
+	Created time.Time
+	modelMu sync.RWMutex
+	model   string
+	active  int64
+	expired atomic.Bool
 
-	// The ELM chat this session currently writes to. Reusing it keeps the
-	// conversation context on the ELM side (and visible in the web history).
-	chatMu     sync.Mutex
-	chatID     string
-	chatModel  string
-	lastPrompt string
+	// turn serializes every prompt that goes through this cookie: one ELM
+	// account runs one chat at a time, so concurrent requests wait here
+	// instead of interleaving inside the web chat.
+	turn chan struct{}
+
+	// The ELM chats this session has written to, most recent first. The web
+	// history is the real context store; these records only remember which
+	// chat a conversation continues.
+	chatMu sync.Mutex
+	chats  []*chatRecord
 }
+
+// newSession builds a session with an empty chat list and a free turn lock.
+func newSession(id, name, cookie string) *Session {
+	return &Session{
+		ID:      id,
+		Name:    name,
+		Cookie:  cookie,
+		Created: time.Now(),
+		turn:    make(chan struct{}, 1),
+	}
+}
+
+// acquireTurn blocks until this session is free. ELM serializes chats per
+// account, so queueing here keeps requests ordered instead of failing them.
+func (s *Session) acquireTurn(ctx context.Context) error {
+	select {
+	case s.turn <- struct{}{}:
+		return nil
+	default:
+	}
+	log.Printf("elm2api: session %s is busy, queueing request (one ELM account runs one chat at a time)", s.ID)
+	select {
+	case s.turn <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Session) releaseTurn() { <-s.turn }
 
 // Model returns the model last observed/selected for the session.
 func (s *Session) Model() string {
@@ -92,6 +123,7 @@ type SessionView struct {
 	Quota   elmcore.Quota `json:"quota"`
 	Expired bool          `json:"expired"`
 	ChatID  string        `json:"chat_id,omitempty"`
+	Chats   []SessionChat `json:"chats,omitempty"`
 }
 
 func sessionID(cookie string) string {
@@ -116,6 +148,9 @@ type Pool struct {
 
 	stateMu   sync.Mutex
 	statePath string
+
+	respMu    sync.Mutex
+	responses map[string]persistedResponse
 }
 
 // NewPool builds a session pool.
@@ -161,7 +196,10 @@ func (p *Pool) Add(ctx context.Context, name, cookie string) (SessionView, error
 	if name = strings.TrimSpace(name); name == "" {
 		name = user.Email
 	}
-	s := &Session{ID: id, Name: name, Cookie: cookie, User: user, Quota: quota, Created: time.Now(), model: model}
+	s := newSession(id, name, cookie)
+	s.User = user
+	s.Quota = quota
+	s.model = model
 	p.mu.Lock()
 	for i, existing := range p.sessions {
 		if existing.ID == id {
@@ -201,7 +239,7 @@ func (p *Pool) addExpired(name, cookie string) {
 			return
 		}
 	}
-	s := &Session{ID: id, Name: name, Cookie: cookie, Created: time.Now()}
+	s := newSession(id, name, cookie)
 	s.expired.Store(true)
 	p.sessions = append(p.sessions, s)
 }
@@ -245,156 +283,8 @@ func (s *Session) view() SessionView {
 		Created: s.Created,
 		Quota:   s.Quota,
 		Expired: s.Expired(),
-		ChatID:  s.chatIDValue(),
-	}
-}
-
-func (s *Session) chatIDValue() string {
-	s.chatMu.Lock()
-	defer s.chatMu.Unlock()
-	return s.chatID
-}
-
-// chatFor decides which ELM chat a prompt belongs to. A session keeps one
-// conversation per model: when the new prompt extends the previous one only the
-// tail is sent, so the ELM web history supplies the context instead of the
-// prompt repeating it. A new chat is opened when the session has none, when the
-// model changes, or when the prompt starts a different conversation.
-func (p *Pool) chatFor(ctx context.Context, s *Session, model, prompt string) (string, string, error) {
-	s.chatMu.Lock()
-	defer s.chatMu.Unlock()
-
-	needNew := s.chatID == ""
-	if !needNew && model != "" && s.chatModel != "" && model != s.chatModel {
-		needNew = true
-	}
-	if !needNew && s.lastPrompt != "" && !strings.HasPrefix(prompt, s.lastPrompt) {
-		needNew = true
-	}
-	if needNew {
-		id, err := p.up.NewChat(ctx, s.Cookie)
-		if err != nil {
-			if errors.Is(err, elmcore.ErrSessionExpired) {
-				s.markExpired(true)
-				return "", "", err
-			}
-			id, err = p.up.ChatID(ctx, s.Cookie)
-			if err != nil {
-				if errors.Is(err, elmcore.ErrSessionExpired) {
-					s.markExpired(true)
-				}
-				return "", "", err
-			}
-		}
-		s.chatID = id
-		s.lastPrompt = ""
-		log.Printf("elm2api: new ELM chat %s for session %s (model %s)", id, s.ID, model)
-	}
-	sendPrompt := prompt
-	if s.lastPrompt != "" && len(prompt) > len(s.lastPrompt) && strings.HasPrefix(prompt, s.lastPrompt) {
-		sendPrompt = strings.TrimLeft(prompt[len(s.lastPrompt):], "\r\n")
-	}
-	if strings.TrimSpace(sendPrompt) == "" {
-		sendPrompt = prompt
-	}
-	s.lastPrompt = prompt
-	if model != "" {
-		s.chatModel = model
-	}
-	return s.chatID, sendPrompt, nil
-}
-
-type persistedChat struct {
-	ChatID     string `json:"chat_id"`
-	Model      string `json:"model"`
-	LastPrompt string `json:"last_prompt,omitempty"`
-}
-
-type persistedState struct {
-	Sessions map[string]persistedChat `json:"sessions"`
-}
-
-// SetStatePath enables persisting chat ids, so a restart (or a session that is
-// logged in again later) resumes the same ELM conversation.
-func (p *Pool) SetStatePath(path string) {
-	p.stateMu.Lock()
-	p.statePath = strings.TrimSpace(path)
-	p.stateMu.Unlock()
-}
-
-func (p *Pool) stateFile() string {
-	p.stateMu.Lock()
-	defer p.stateMu.Unlock()
-	return p.statePath
-}
-
-// LoadState restores chat ids saved by an earlier run.
-func (p *Pool) LoadState() {
-	path := p.stateFile()
-	if path == "" {
-		return
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("elm2api: read chat state %s: %v", path, err)
-		}
-		return
-	}
-	var st persistedState
-	if err := json.Unmarshal(raw, &st); err != nil {
-		log.Printf("elm2api: parse chat state %s: %v", path, err)
-		return
-	}
-	restored := 0
-	p.mu.RLock()
-	for _, s := range p.sessions {
-		c, ok := st.Sessions[s.ID]
-		if !ok || strings.TrimSpace(c.ChatID) == "" {
-			continue
-		}
-		s.chatMu.Lock()
-		wasEmpty := s.chatID == ""
-		s.chatID = c.ChatID
-		s.chatModel = c.Model
-		s.lastPrompt = c.LastPrompt
-		s.chatMu.Unlock()
-		if wasEmpty {
-			restored++
-		}
-	}
-	p.mu.RUnlock()
-	if restored > 0 {
-		log.Printf("elm2api: restored %d ELM chat(s) from %s", restored, path)
-	}
-}
-
-// SaveState writes chat ids and the last prompt of every session.
-func (p *Pool) SaveState() {
-	path := p.stateFile()
-	if path == "" {
-		return
-	}
-	st := persistedState{Sessions: map[string]persistedChat{}}
-	p.mu.RLock()
-	for _, s := range p.sessions {
-		s.chatMu.Lock()
-		st.Sessions[s.ID] = persistedChat{ChatID: s.chatID, Model: s.chatModel, LastPrompt: s.lastPrompt}
-		s.chatMu.Unlock()
-	}
-	p.mu.RUnlock()
-	raw, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		log.Printf("elm2api: encode chat state: %v", err)
-		return
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		log.Printf("elm2api: write chat state %s: %v", tmp, err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		log.Printf("elm2api: replace chat state %s: %v", path, err)
+		ChatID:  s.primaryChatID(),
+		Chats:   s.chatList(),
 	}
 }
 
@@ -420,8 +310,10 @@ func (p *Pool) SetSessionModel(ctx context.Context, id, model string) (string, e
 	if err != nil {
 		return "", err
 	}
-	s.SwitchMu.Lock()
-	defer s.SwitchMu.Unlock()
+	if err := s.acquireTurn(ctx); err != nil {
+		return "", err
+	}
+	defer s.releaseTurn()
 	if err := p.up.SetModel(ctx, s.Cookie, resolved); err != nil {
 		if errors.Is(err, elmcore.ErrSessionExpired) {
 			s.markExpired(true)
@@ -593,56 +485,173 @@ func (p *Pool) pick(model string) *Session {
 	return best
 }
 
-// Chat runs one prompt through the pool with concurrency limits and per-session
-// model switching. The session switch lock is held only until the first streamed
-// delta, so same-model chats run in parallel and different models serialize just
-// the switch window.
+// Chat runs one prompt for the chat-completions surface. The prompt usually
+// repeats the whole conversation, so it is matched against the chats this
+// session already has: an extending prompt only sends the new turn, an edited
+// or unrelated prompt starts a new ELM chat (the web chat cannot be rewound).
 func (p *Pool) Chat(ctx context.Context, model, prompt string, onDelta func(elmcore.DeltaKind, string) error) error {
-	select {
-	case p.sem <- struct{}{}:
-		defer func() { <-p.sem }()
-	default:
-		timer := time.NewTimer(p.queueWait)
-		defer timer.Stop()
-		select {
-		case p.sem <- struct{}{}:
-			defer func() { <-p.sem }()
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-			return ErrBusy
+	return p.withSession(ctx, model, func(s *Session) error {
+		rec, sendPrompt, err := p.prepareChat(ctx, s, prompt)
+		if err != nil {
+			return err
 		}
+		emitted := false
+		wrap := func(kind elmcore.DeltaKind, text string) error {
+			emitted = true
+			return onDelta(kind, text)
+		}
+		err = p.sendPrompt(ctx, s, rec.ID, sendPrompt, model, wrap)
+		if err != nil && !emitted && rec.PrevLen > 0 {
+			// The remembered chat is gone (deleted in the web UI) or unusable;
+			// start a fresh one instead of failing the client.
+			id, chatErr := p.openChat(ctx, s)
+			if chatErr != nil {
+				return err
+			}
+			log.Printf("elm2api: chat %s unusable (%v), opened %s instead", rec.ID, err, id)
+			rec = s.noteChat(id, prompt)
+			err = p.sendPrompt(ctx, s, id, prompt, model, wrap)
+		}
+		if err != nil {
+			return err
+		}
+		s.rememberChat(rec, model, prompt)
+		return nil
+	})
+}
+
+// ChatIn runs one prompt in a specific ELM chat (empty chatID opens a new one)
+// and returns the chat id plus the session id that served it. It backs the
+// Responses API, where the conversation is continued by id instead of by
+// resending the prompt.
+func (p *Pool) ChatIn(ctx context.Context, model, prompt, chatID string, onDelta func(elmcore.DeltaKind, string) error) (string, string, error) {
+	used := strings.TrimSpace(chatID)
+	sessionID := ""
+	err := p.withSession(ctx, model, func(s *Session) error {
+		sessionID = s.ID
+		emitted := false
+		wrap := func(kind elmcore.DeltaKind, text string) error {
+			emitted = true
+			return onDelta(kind, text)
+		}
+		if used == "" {
+			id, err := p.openChat(ctx, s)
+			if err != nil {
+				return err
+			}
+			used = id
+			s.noteChat(id, prompt)
+		} else {
+			s.noteChat(used, "")
+		}
+		err := p.sendPrompt(ctx, s, used, prompt, model, wrap)
+		if err != nil && !emitted {
+			id, chatErr := p.openChat(ctx, s)
+			if chatErr != nil {
+				return err
+			}
+			log.Printf("elm2api: chat %s unusable (%v), opened %s instead", used, err, id)
+			used = id
+			s.noteChat(id, prompt)
+			err = p.sendPrompt(ctx, s, id, prompt, model, wrap)
+		}
+		return err
+	})
+	return used, sessionID, err
+}
+
+// withSession runs fn with a concurrency slot, a chosen session and that
+// session's turn lock held.
+func (p *Pool) withSession(ctx context.Context, model string, fn func(*Session) error) error {
+	if err := p.acquireSlot(ctx); err != nil {
+		return err
 	}
+	defer p.releaseSlot()
 	s := p.pick(model)
 	if s == nil {
 		return ErrNoSession
 	}
 	atomic.AddInt64(&s.active, 1)
 	defer atomic.AddInt64(&s.active, -1)
-
-	// Reuse the session's chat so the ELM-side history carries the context;
-	// a new chat is only opened for a model change or a new conversation.
-	chatID, sendPrompt, err := p.chatFor(ctx, s, model, prompt)
-	if err != nil {
+	if err := s.acquireTurn(ctx); err != nil {
 		return err
 	}
-	defer p.SaveState()
+	defer s.releaseTurn()
+	err := fn(s)
+	p.SaveState()
+	return err
+}
 
-	s.SwitchMu.Lock()
-	locked := true
-	unlock := func() {
-		if locked {
-			locked = false
-			s.SwitchMu.Unlock()
+func (p *Pool) acquireSlot(ctx context.Context) error {
+	select {
+	case p.sem <- struct{}{}:
+		return nil
+	default:
+	}
+	timer := time.NewTimer(p.queueWait)
+	defer timer.Stop()
+	select {
+	case p.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ErrBusy
+	}
+}
+
+func (p *Pool) releaseSlot() { <-p.sem }
+
+// prepareChat picks the chat a chat-completions prompt continues.
+func (p *Pool) prepareChat(ctx context.Context, s *Session, prompt string) (*chatRecord, string, error) {
+	if rec := s.matchChat(prompt); rec != nil {
+		send := prompt
+		if len(prompt) > rec.PrevLen {
+			if tail := strings.TrimLeft(prompt[rec.PrevLen:], " \t\r\n"); strings.TrimSpace(tail) != "" {
+				send = tail
+			}
 		}
+		return rec, send, nil
 	}
-	sendModel := model
-	if sendModel != "" && s.Model() == sendModel {
-		sendModel = ""
+	id, err := p.openChat(ctx, s)
+	if err != nil {
+		return nil, "", err
 	}
-	chunks := splitPrompt(sendPrompt, elmMaxPromptChars-len(splitContextPrefix))
+	log.Printf("elm2api: prompt does not continue a known chat, opening ELM chat %s for session %s", id, s.ID)
+	return s.noteChat(id, prompt), prompt, nil
+}
+
+// openChat asks ELM for a fresh chat id, falling back to the session's current
+// chat when the endpoint refuses.
+func (p *Pool) openChat(ctx context.Context, s *Session) (string, error) {
+	id, err := p.up.NewChat(ctx, s.Cookie)
+	if err == nil {
+		return id, nil
+	}
+	if errors.Is(err, elmcore.ErrSessionExpired) {
+		s.markExpired(true)
+		return "", err
+	}
+	fallback, fallbackErr := p.up.ChatID(ctx, s.Cookie)
+	if fallbackErr != nil {
+		if errors.Is(fallbackErr, elmcore.ErrSessionExpired) {
+			s.markExpired(true)
+		}
+		return "", fallbackErr
+	}
+	return fallback, nil
+}
+
+// sendPrompt writes one prompt into chatID, splitting it when it exceeds the
+// ELM message limit. Only the final chunk's deltas reach onDelta.
+func (p *Pool) sendPrompt(ctx context.Context, s *Session, chatID, prompt, model string, onDelta func(elmcore.DeltaKind, string) error) error {
+	sendModel := ""
+	if model != "" && s.Model() != model {
+		sendModel = model
+	}
+	chunks := splitPrompt(prompt, elmMaxPromptChars-len(splitContextPrefix))
 	if len(chunks) > 1 {
-		log.Printf("elm2api: prompt split into %d messages (%d chars, ELM limit ~%d)", len(chunks), len(sendPrompt), elmMaxPromptChars)
+		log.Printf("elm2api: prompt split into %d messages (%d chars, ELM limit ~%d)", len(chunks), len(prompt), elmMaxPromptChars)
 	}
 	for i, chunk := range chunks {
 		last := i == len(chunks)-1
@@ -654,23 +663,18 @@ func (p *Pool) Chat(ctx context.Context, model, prompt string, onDelta func(elmc
 		if i > 0 {
 			sendThis = ""
 		}
-		err = p.up.StreamChat(ctx, s.Cookie, chatID, body, sendThis, func(kind elmcore.DeltaKind, text string) error {
-			unlock()
+		err := p.up.StreamChat(ctx, s.Cookie, chatID, body, sendThis, func(kind elmcore.DeltaKind, text string) error {
 			if !last {
 				return nil
 			}
 			return onDelta(kind, text)
 		})
-		unlock()
 		if err != nil {
-			break
+			if errors.Is(err, elmcore.ErrSessionExpired) {
+				s.markExpired(true)
+			}
+			return err
 		}
-	}
-	if err != nil {
-		if errors.Is(err, elmcore.ErrSessionExpired) {
-			s.markExpired(true)
-		}
-		return err
 	}
 	s.markExpired(false)
 	if strings.TrimSpace(model) != "" && s.Model() != model {

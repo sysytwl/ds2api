@@ -48,6 +48,7 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("GET "+prefix+"/models", s.requireKey(s.handleModels))
 		mux.HandleFunc("GET "+prefix+"/models/{id}", s.requireKey(s.handleModelByID))
 		mux.HandleFunc("POST "+prefix+"/chat/completions", s.requireKey(s.handleChat))
+		mux.HandleFunc("POST "+prefix+"/responses", s.requireKey(s.handleResponses))
 	}
 	mux.HandleFunc("GET /api/status", s.loopback(s.requireKey(s.handleStatus)))
 	mux.HandleFunc("GET /api/sessions", s.loopback(s.requireKey(s.handleSessions)))
@@ -55,7 +56,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/sessions/{id}", s.loopback(s.requireKey(s.handleRemoveSession)))
 	mux.HandleFunc("PUT /api/sessions/{id}/model", s.loopback(s.requireKey(s.handleSwitchModel)))
 	mux.HandleFunc("POST /api/models/refresh", s.loopback(s.requireKey(s.handleRefreshModels)))
-	mux.HandleFunc("GET /", s.loopback(s.requireKey(s.handleIndex)))
+	// The catch-all has no method so an unknown path answers with JSON (and the
+	// list of real endpoints) instead of net/http's bare 405/404.
+	mux.HandleFunc("/", s.loopback(s.requireKey(s.handleIndex)))
 	mux.HandleFunc("POST /ui/login", s.loopback(s.requireKey(s.handleUILogin)))
 	mux.HandleFunc("POST /ui/switch", s.loopback(s.requireKey(s.handleUISwitch)))
 	mux.HandleFunc("POST /ui/remove", s.loopback(s.requireKey(s.handleUIRemove)))
@@ -435,8 +438,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"default_model": s.cfg.DefaultModel,
 		"listen":        s.cfg.Listen,
 		"concurrency": map[string]any{
-			"max":    cap(s.pool.sem),
-			"in_use": len(s.pool.sem),
+			"max":         cap(s.pool.sem),
+			"in_use":      len(s.pool.sem),
+			"per_account": 1,
 		},
 		"sessions": s.pool.Views(),
 		"models":   len(models),
@@ -518,7 +522,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 				"type":    "invalid_request_error",
 			},
 			"hint": "OpenAI base_url = http://" + displayListen(s.cfg.Listen) + "/v1 （带不带 /v1 都可以）；" +
-				"可用接口：GET /v1/models、POST /v1/chat/completions、GET /api/status",
+				"可用接口：GET /v1/models、POST /v1/chat/completions、POST /v1/responses、GET /api/status",
 		})
 		return
 	}
@@ -617,13 +621,14 @@ button.secondary { background: #33465e; }
 <h2>已登录会话（{{len .Sessions}}）</h2>
 {{if .Sessions}}
 <table>
-<tr><th>名称</th><th>账号</th><th>当前模型</th><th>并发</th><th>预算</th><th>操作</th></tr>
+<tr><th>名称</th><th>账号</th><th>当前模型</th><th>ELM 聊天的</th><th>并发</th><th>预算</th><th>操作</th></tr>
 {{range .Sessions}}
 {{$sess := .}}
 <tr>
   <td>{{.Name}}{{if .Expired}} <span class="expired">（cookie 已过期）</span>{{end}}<div class="muted">{{.ID}}</div></td>
   <td>{{.Email}}</td>
   <td><code>{{.Model}}</code></td>
+  <td>{{if .Chats}}{{len .Chats}} 个聊天<div class="muted"><code>{{.ChatID}}</code></div><div class="muted">{{(index .Chats 0).Opening}}</div>{{else}}—{{end}}</td>
   <td>{{.Active}}</td>
   <td>已用 £{{printf "%.2f" .Quota.UsageGBP}} / 剩余 £{{printf "%.2f" .Quota.RemainingGBP}}</td>
   <td>

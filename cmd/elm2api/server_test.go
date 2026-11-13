@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,6 +32,9 @@ type fakeUpstream struct {
 	newChatCalls  int
 	quota         elmcore.Quota
 	failChat      error
+	// failChatID, when set, restricts failChat to one chat id (a chat that was
+	// deleted in the web UI still answers, the other chats do not).
+	failChatID string
 }
 
 func (f *fakeUpstream) IsLoggedIn(context.Context, string) (bool, error) {
@@ -54,10 +58,11 @@ func (f *fakeUpstream) Models(context.Context, string) ([]elmcore.Model, error) 
 func (f *fakeUpstream) ChatID(context.Context, string) (string, error) { return "chat-1", nil }
 func (f *fakeUpstream) NewChat(context.Context, string) (string, error) {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.newChatCalls++
-	f.mu.Unlock()
-	return "new-chat-1", nil
+	return fmt.Sprintf("new-chat-%d", f.newChatCalls), nil
 }
+
 func (f *fakeUpstream) SetModel(_ context.Context, _ string, model string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -77,14 +82,18 @@ func (f *fakeUpstream) StreamChat(ctx context.Context, _ string, chatID string, 
 	if f.active > f.maxActive {
 		f.maxActive = f.active
 	}
+	fail := f.failChat
+	if fail != nil && f.failChatID != "" && f.failChatID != chatID {
+		fail = nil
+	}
 	f.mu.Unlock()
 	defer func() {
 		f.mu.Lock()
 		f.active--
 		f.mu.Unlock()
 	}()
-	if f.failChat != nil {
-		return f.failChat
+	if fail != nil {
+		return fail
 	}
 	if f.expired {
 		return elmcore.ErrSessionExpired
@@ -204,11 +213,14 @@ func TestPoolAddValidatesLogin(t *testing.T) {
 	}
 }
 
-func TestPoolChatConcurrencyLimit(t *testing.T) {
-	f := &fakeUpstream{loggedIn: true, models: testModels, delay: 80 * time.Millisecond}
-	pool, _ := newTestPool(t, f, 2)
+// One ELM account runs one chat at a time (a second conversation in the web UI
+// waits for the first), so requests on the same cookie must queue instead of
+// interleaving.
+func TestPoolChatSerializesPerSession(t *testing.T) {
+	f := &fakeUpstream{loggedIn: true, models: testModels, delay: 40 * time.Millisecond}
+	pool, _ := newTestPool(t, f, 4)
 	var wg sync.WaitGroup
-	for i := 0; i < 6; i++ {
+	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -218,8 +230,33 @@ func TestPoolChatConcurrencyLimit(t *testing.T) {
 	wg.Wait()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.maxActive > 2 {
-		t.Fatalf("max concurrent chats = %d, want <= 2", f.maxActive)
+	if f.maxActive != 1 {
+		t.Fatalf("max concurrent chats = %d, want 1 (ELM serializes per account)", f.maxActive)
+	}
+}
+
+// Different cookies are different accounts, so they still run in parallel.
+func TestPoolChatParallelAcrossSessions(t *testing.T) {
+	f := &fakeUpstream{loggedIn: true, models: testModels, delay: 80 * time.Millisecond}
+	pool := NewPool(f, "", 4, 5, 60)
+	for _, cookie := range []string{"SESSION=a", "SESSION=b"} {
+		if _, err := pool.Add(context.Background(), cookie, cookie); err != nil {
+			t.Fatalf("add %s: %v", cookie, err)
+		}
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = pool.Chat(context.Background(), "", "hi", func(elmcore.DeltaKind, string) error { return nil })
+		}()
+	}
+	wg.Wait()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.maxActive != 2 {
+		t.Fatalf("max concurrent chats = %d, want 2", f.maxActive)
 	}
 }
 

@@ -43,10 +43,22 @@ Linux：
 
 模型列表：`GET /v1/models`（网页端全部模型，含 Claude / GPT / Gemini / Llama 等）。
 
-切换模型：请求里带不同的 `model` 即可。注意 ELM 的模型是**会话级**设置，同一个 cookie 同时只能跑一个模型；
-需要并行不同模型时，在 `sessions` 里配多个 cookie。
+切换模型：请求里带不同的 `model` 即可。ELM 的模型是**会话级**设置，换模型会**继续同一个对话**（不新建 chat、不丢上下文）。
+但**一个账号同一时刻只能跑一个聊天**：第二个请求会排队等第一个结束（日志打印 `queueing request`），要并行请配多个账号的 cookie。
 
-同一个 session 复用同一个 ELM chat：上下文由 ELM 网页端历史承担，所以回答会出现在网页聊天记录里（正常现象）。只有**换模型**、**换 session** 或**开始新对话**时才自动新建 chat；chat id 保存在 `state_file`（默认 `elm2api-state.json`），重启后能接着聊。
+同一个 session 复用同一个 ELM chat：上下文由 ELM 网页端历史承担，所以回答会出现在网页聊天记录里（正常现象）。
+续聊时只把**新增的那一轮**发给 ELM；只有**回滚/新对话/换 session** 才新建 chat。chat id 与 Responses 的响应 id 都保存在 `state_file`（默认 `elm2api-state.json`），重启后能接着聊。
+
+### Responses API
+
+`POST /v1/responses` 支持 `previous_response_id`：把返回的 `resp_...` 下次传回来即可继续同一段对话，不需要重发历史。
+
+```bash
+curl http://127.0.0.1:8787/v1/responses -H "Content-Type: application/json" \
+  -d '{"model":"qwen-3.5","input":"hi"}'
+```
+
+响应 id 失效（网页里删了 chat、state 重置）时会自动新建 chat；`store:false` 暂不支持续聊，等价于每次新建 chat。
 
 ## 4. 验证
 
@@ -73,10 +85,12 @@ curl -X POST http://127.0.0.1:8787/api/sessions -H "Content-Type: application/js
 - **404**：base_url 指向 `http://127.0.0.1:8787` 或 `http://127.0.0.1:8787/v1` 都可以，
   不要写成 `.../v1/chat/completions` 当 base_url。
 - **API key wrong**：默认不校验 key；只有 `config.json` 的 `api_keys` 非空时才校验。
-- **空回复（EMPTY_RESPONSE）**：ELM 网页端偶发断流，服务会自动重试；仍失败就直接重试请求。
+- **空回复（EMPTY_RESPONSE）**：ELM 网页端偶发断流，服务会自动重试；仍失败就直接重试请求（重试会复用同一个 chat，上下文不丢）。
 - **长 prompt 超限**：ELM 网页端单条消息上限约 16K 字符；超过时服务会自动把 prompt 切成多条消息依次发送（同一 chat），不需要你手动处理。
 - **只支持纯文本对话**：不支持工具调用、文件上传、图片输入。
-- **回答跑到浏览器里打开的聊天中**：这是预期行为（API 伪装自网页聊天），历史会留在 ELM 网页端；换模型/换 session/新对话时会新建 chat。
+- **回答跑到浏览器里打开的聊天中**：这是预期行为（API 伪装自网页聊天），历史会留在 ELM 网页端；回滚/新对话/换 session 时才会新建 chat，换模型不会。
+- **第二个请求很慢 / 日志出现 `queueing request`**：一个 ELM 账号同一时刻只能跑一个聊天，正常排队；要并行请配多个账号。
+- **`previous_response_id` 失效**：会当作新对话自动新建 chat（日志会说明）。
 - **模型列表里只有 DeepSeek**：说明启动的是旧的 `ds2api-elm-*.exe`，请运行本包的 `elm2api.exe`（29 个网页端模型 + Qwen 等，共 31 个）。
 
 ## 7. 配置文件
@@ -92,5 +106,6 @@ curl -X POST http://127.0.0.1:8787/api/sessions -H "Content-Type: application/js
 | `api_keys` | `[]` | 非空时 `/v1` 需要 `Authorization: Bearer <key>` |
 | `model_list_ttl_seconds` | 300 | 模型列表缓存时间 |
 | `check_interval_seconds` | 300 | cookie 巡检间隔，0 关闭 |
+| `state_file` | `elm2api-state.json` | 记录 chat id / Responses 映射（不含完整 prompt），留空则不落盘 |
 
 环境变量：`ELM_CONFIG`、`ELM_LISTEN`、`ELM_BASE_URL`、`ELM_MODEL`、`ELM_MAX_CONCURRENCY`、`ELM_API_KEYS`、`ELM_CHECK_INTERVAL`、`ELM_SESSION`。
