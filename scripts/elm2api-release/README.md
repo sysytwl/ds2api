@@ -46,7 +46,7 @@ Linux：
 切换模型：请求里带不同的 `model` 即可。注意 ELM 的模型是**会话级**设置，同一个 cookie 同时只能跑一个模型；
 需要并行不同模型时，在 `sessions` 里配多个 cookie。
 
-每个 API 请求都会向 ELM 申请一个**新的 chat**，不会混进你在浏览器里打开的那个聊天；多轮上下文请把历史消息一起放进 `messages`。
+同一个 session 复用同一个 ELM chat：上下文由 ELM 网页端历史承担，所以回答会出现在网页聊天记录里（正常现象）。只有**换模型**、**换 session** 或**开始新对话**时才自动新建 chat；chat id 保存在 `state_file`（默认 `elm2api-state.json`），重启后能接着聊。
 
 ## 4. 验证
 
@@ -76,7 +76,7 @@ curl -X POST http://127.0.0.1:8787/api/sessions -H "Content-Type: application/js
 - **空回复（EMPTY_RESPONSE）**：ELM 网页端偶发断流，服务会自动重试；仍失败就直接重试请求。
 - **长 prompt 超限**：ELM 网页端单条消息上限约 16K 字符；超过时服务会自动把 prompt 切成多条消息依次发送（同一 chat），不需要你手动处理。
 - **只支持纯文本对话**：不支持工具调用、文件上传、图片输入。
-- **回答跑到浏览器里打开的聊天中**：旧版本复用会话当前 chat；新版本每个请求新建 chat，已修复。
+- **回答跑到浏览器里打开的聊天中**：这是预期行为（API 伪装自网页聊天），历史会留在 ELM 网页端；换模型/换 session/新对话时会新建 chat。
 - **模型列表里只有 DeepSeek**：说明启动的是旧的 `ds2api-elm-*.exe`，请运行本包的 `elm2api.exe`（29 个网页端模型 + Qwen 等，共 31 个）。
 
 ## 7. 配置文件

@@ -19,6 +19,7 @@ type Config struct {
 	APIKeys          []string        `json:"api_keys"`
 	ModelListTTL     int             `json:"model_list_ttl_seconds"`
 	CheckInterval    int             `json:"check_interval_seconds"`
+	StateFile        string          `json:"state_file"`
 }
 
 // SessionConfig is one ELM browser session cookie.
@@ -36,6 +37,7 @@ func DefaultConfig() Config {
 		QueueWaitSeconds: 30,
 		ModelListTTL:     300,
 		CheckInterval:    300,
+		StateFile:        "elm2api-state.json",
 	}
 }
 
@@ -73,6 +75,9 @@ func applyEnv(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("ELM_API_KEYS")); v != "" {
 		cfg.APIKeys = splitList(v)
 	}
+	if v := strings.TrimSpace(os.Getenv("ELM_STATE_FILE")); v != "" {
+		cfg.StateFile = v
+	}
 	if v := strings.TrimSpace(os.Getenv("ELM_CHECK_INTERVAL")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.CheckInterval = n
@@ -96,6 +101,7 @@ func normalizeConfig(cfg *Config) {
 		cfg.BaseURL = "https://elm.edina.ac.uk"
 	}
 	cfg.DefaultModel = strings.TrimSpace(cfg.DefaultModel)
+	cfg.StateFile = strings.TrimSpace(cfg.StateFile)
 	if cfg.MaxConcurrency <= 0 {
 		cfg.MaxConcurrency = 4
 	}

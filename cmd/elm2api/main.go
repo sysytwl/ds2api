@@ -33,6 +33,7 @@ func main() {
 	}
 	upstream := elmcore.New(cfg.BaseURL)
 	pool := NewPool(upstream, cfg.DefaultModel, cfg.MaxConcurrency, cfg.QueueWaitSeconds, cfg.ModelListTTL)
+	pool.SetStatePath(cfg.StateFile)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	sessions := cfg.Sessions
@@ -54,6 +55,7 @@ func main() {
 		}
 	}
 	cancel()
+	pool.LoadState()
 	if len(pool.Views()) == 0 {
 		logNoSession(cfg.Listen, cfg.BaseURL)
 	}

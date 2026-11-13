@@ -15,19 +15,22 @@ import (
 )
 
 type fakeUpstream struct {
-	mu           sync.Mutex
-	loggedIn     bool
-	expired      bool
-	models       []elmcore.Model
-	chatCalls    int
-	active       int
-	maxActive    int
-	delay        time.Duration
-	setModels    []string
-	streamModels []string
-	user         elmcore.User
-	quota        elmcore.Quota
-	failChat     error
+	mu            sync.Mutex
+	loggedIn      bool
+	expired       bool
+	models        []elmcore.Model
+	chatCalls     int
+	active        int
+	maxActive     int
+	delay         time.Duration
+	setModels     []string
+	streamModels  []string
+	user          elmcore.User
+	streamPrompts []string
+	streamChats   []string
+	newChatCalls  int
+	quota         elmcore.Quota
+	failChat      error
 }
 
 func (f *fakeUpstream) IsLoggedIn(context.Context, string) (bool, error) {
@@ -48,8 +51,13 @@ func (f *fakeUpstream) Quota(context.Context, string) (elmcore.Quota, error) {
 func (f *fakeUpstream) Models(context.Context, string) ([]elmcore.Model, error) {
 	return f.models, nil
 }
-func (f *fakeUpstream) ChatID(context.Context, string) (string, error)  { return "chat-1", nil }
-func (f *fakeUpstream) NewChat(context.Context, string) (string, error) { return "new-chat-1", nil }
+func (f *fakeUpstream) ChatID(context.Context, string) (string, error) { return "chat-1", nil }
+func (f *fakeUpstream) NewChat(context.Context, string) (string, error) {
+	f.mu.Lock()
+	f.newChatCalls++
+	f.mu.Unlock()
+	return "new-chat-1", nil
+}
 func (f *fakeUpstream) SetModel(_ context.Context, _ string, model string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -59,10 +67,12 @@ func (f *fakeUpstream) SetModel(_ context.Context, _ string, model string) error
 func (f *fakeUpstream) CurrentModel(context.Context, string) (string, error) {
 	return "Qwen/Qwen3.5-397B-A17B-FP8", nil
 }
-func (f *fakeUpstream) StreamChat(ctx context.Context, _ string, _ string, prompt, model string, onDelta func(elmcore.DeltaKind, string) error) error {
+func (f *fakeUpstream) StreamChat(ctx context.Context, _ string, chatID string, prompt, model string, onDelta func(elmcore.DeltaKind, string) error) error {
 	f.mu.Lock()
 	f.chatCalls++
 	f.streamModels = append(f.streamModels, model)
+	f.streamPrompts = append(f.streamPrompts, prompt)
+	f.streamChats = append(f.streamChats, chatID)
 	f.active++
 	if f.active > f.maxActive {
 		f.maxActive = f.active
