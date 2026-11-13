@@ -41,9 +41,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	})
-	mux.HandleFunc("GET /v1/models", s.requireKey(s.handleModels))
-	mux.HandleFunc("GET /v1/models/{id}", s.requireKey(s.handleModelByID))
-	mux.HandleFunc("POST /v1/chat/completions", s.requireKey(s.handleChat))
+	// OpenAI-compatible surface. The same endpoints are served with and
+	// without the /v1 prefix so any client base_url works, and a trailing
+	// slash is tolerated (some clients append one).
+	for _, prefix := range []string{"", "/v1"} {
+		mux.HandleFunc("GET "+prefix+"/models", s.requireKey(s.handleModels))
+		mux.HandleFunc("GET "+prefix+"/models/{id}", s.requireKey(s.handleModelByID))
+		mux.HandleFunc("POST "+prefix+"/chat/completions", s.requireKey(s.handleChat))
+	}
 	mux.HandleFunc("GET /api/status", s.loopback(s.requireKey(s.handleStatus)))
 	mux.HandleFunc("GET /api/sessions", s.loopback(s.requireKey(s.handleSessions)))
 	mux.HandleFunc("POST /api/sessions", s.loopback(s.requireKey(s.handleAddSession)))
@@ -54,7 +59,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /ui/login", s.loopback(s.requireKey(s.handleUILogin)))
 	mux.HandleFunc("POST /ui/switch", s.loopback(s.requireKey(s.handleUISwitch)))
 	mux.HandleFunc("POST /ui/remove", s.loopback(s.requireKey(s.handleUIRemove)))
-	return logRequests(mux)
+	return logRequests(withCORS(trimTrailingSlash(mux)))
 }
 
 func (s *Server) requireKey(next http.HandlerFunc) http.HandlerFunc {
@@ -98,12 +103,88 @@ func isLoopback(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// trimTrailingSlash rewrites "/v1/models/" to "/v1/models" so clients that
+// append a slash keep working without an extra redirect round-trip.
+func trimTrailingSlash(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if len(path) > 1 && strings.HasSuffix(path, "/") {
+			trimmed := strings.TrimRight(path, "/")
+			if trimmed == "" {
+				trimmed = "/"
+			}
+			clone := r.Clone(r.Context())
+			u := *r.URL
+			u.Path = trimmed
+			clone.URL = &u
+			next.ServeHTTP(w, clone)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withCORS lets browser-based OpenAI clients call the local service directly.
+// Only the chat surface gets CORS, never the loopback management endpoints.
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1") || strings.HasPrefix(r.URL.Path, "/models") || strings.HasPrefix(r.URL.Path, "/chat/") {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Api-Key")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// statusRecorder captures the response code so the request log shows it.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if s.status == 0 {
+		s.status = code
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+func isAPIPath(path string) bool {
+	return strings.HasPrefix(path, "/v1/") || strings.HasPrefix(path, "/api/") ||
+		strings.HasPrefix(path, "/models") || strings.HasPrefix(path, "/chat/")
+}
+
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		if strings.HasPrefix(r.URL.Path, "/v1/") || strings.HasPrefix(r.URL.Path, "/api/") {
-			log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
+		rec := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+		if rec.status == 0 {
+			rec.status = http.StatusOK
+		}
+		if isAPIPath(r.URL.Path) {
+			log.Printf("%s %s %d %s", r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond))
 		}
 	})
 }
@@ -119,13 +200,13 @@ func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
 		status = http.StatusUnauthorized
 		code = "elm_session_expired"
 		payload = errorPayload(err.Error(), code)
-		payload["hint"] = cookieHelp
+		payload["hint"] = cookieHelp(s.cfg.Listen)
 		s.logExpiredSessions()
 	case errors.Is(err, ErrNoSession):
 		status = http.StatusServiceUnavailable
 		code = "elm_session_missing"
 		payload = errorPayload(err.Error(), code)
-		payload["hint"] = cookieHelp
+		payload["hint"] = cookieHelp(s.cfg.Listen)
 	case errors.Is(err, ErrBusy):
 		status = http.StatusTooManyRequests
 		payload = errorPayload(err.Error(), "busy")
@@ -244,6 +325,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		s.writeUpstreamError(w, err)
 		return
 	}
+	if content.Len() == 0 && thinking.Len() == 0 {
+		s.writeEmptyReplyError(w, nil)
+		return
+	}
 	writeJSON(w, http.StatusOK, completionPayload(id, displayModel, content.String(), thinking.String()))
 }
 
@@ -253,44 +338,86 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, id, di
 		writeJSON(w, http.StatusInternalServerError, errorPayload("streaming unsupported", "internal_error"))
 		return
 	}
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-
-	emit := func(payload map[string]any) error {
+	var contentLen, thinkingLen int
+	started := false
+	emit := func(payload map[string]any) {
 		if err := ssePayload(w, payload); err != nil {
-			return err
+			log.Printf("stream write failed: %v", err)
 		}
 		flusher.Flush()
-		return nil
 	}
-	_ = emit(chunkPayload(id, displayModel, created, map[string]any{"role": "assistant", "content": ""}))
+	// Headers are only sent once the upstream actually produced something, so
+	// an upstream failure can still be reported as a real HTTP error instead of
+	// an empty 200 stream that clients read as "no content".
+	start := func() {
+		if started {
+			return
+		}
+		started = true
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		emit(chunkPayload(id, displayModel, created, map[string]any{"role": "assistant", "content": ""}))
+	}
 
 	err := s.pool.Chat(r.Context(), resolved, prompt, func(kind elmcore.DeltaKind, text string) error {
-		delta := map[string]any{"content": text}
+		start()
 		if kind == elmcore.DeltaThinking {
-			delta = map[string]any{"reasoning_content": text}
+			thinkingLen += len(text)
+			emit(chunkPayload(id, displayModel, created, map[string]any{"reasoning_content": text}))
+			return nil
 		}
-		return emit(chunkPayload(id, displayModel, created, delta))
+		contentLen += len(text)
+		emit(chunkPayload(id, displayModel, created, map[string]any{"content": text}))
+		return nil
 	})
 	if err != nil {
-		if r.Context().Err() == nil {
-			log.Printf("stream chat failed: %v", err)
-			payload := errorPayload(err.Error(), "upstream_error")
-			if errors.Is(err, elmcore.ErrSessionExpired) {
-				payload = errorPayload(err.Error(), "elm_session_expired")
-				payload["hint"] = cookieHelp
-				s.logExpiredSessions()
-			}
-			_ = emit(payload)
+		if r.Context().Err() != nil {
+			return
 		}
+		log.Printf("stream chat failed: %v", err)
+		if !started {
+			s.writeUpstreamError(w, err)
+			return
+		}
+		payload := errorPayload(err.Error(), "upstream_error")
+		if errors.Is(err, elmcore.ErrSessionExpired) {
+			payload = errorPayload(err.Error(), "elm_session_expired")
+			payload["hint"] = cookieHelp(s.cfg.Listen)
+			s.logExpiredSessions()
+		}
+		emit(payload)
 		return
 	}
-	_ = emit(finishChunkPayload(id, displayModel, created, "stop"))
+	if contentLen == 0 && thinkingLen == 0 {
+		if !started {
+			s.writeEmptyReplyError(w, nil)
+			return
+		}
+		emit(emptyReplyPayload(nil))
+		return
+	}
+	start()
+	emit(finishChunkPayload(id, displayModel, created, "stop"))
 	_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+// emptyReplyPayload is returned when ELM finishes a chat without any text.
+func emptyReplyPayload(err error) map[string]any {
+	message := "ELM returned an empty reply"
+	if err != nil {
+		message = "ELM returned an empty reply: " + err.Error()
+	}
+	payload := errorPayload(message, "empty_upstream_response")
+	payload["hint"] = "ELM 网页端偶发返回空回复（通常是上游 websocket 被临时断开），直接重试即可；若持续出现请检查会话是否被网页端占用"
+	return payload
+}
+
+func (s *Server) writeEmptyReplyError(w http.ResponseWriter, err error) {
+	writeJSON(w, http.StatusBadGateway, emptyReplyPayload(err))
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -326,7 +453,7 @@ func (s *Server) handleAddSession(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, elmcore.ErrSessionExpired) {
 			logExpired(strings.TrimSpace(req.Name), "", s.cfg.Listen)
 			payload := errorPayload(err.Error(), "elm_session_expired")
-			payload["hint"] = cookieHelp
+			payload["hint"] = cookieHelp(s.cfg.Listen)
 			writeJSON(w, http.StatusUnauthorized, payload)
 			return
 		}
@@ -375,7 +502,15 @@ func (s *Server) handleRefreshModels(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
-		http.NotFound(w, r)
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error": map[string]any{
+				"code":    "not_found",
+				"message": "no such endpoint: " + r.Method + " " + r.URL.Path,
+				"type":    "invalid_request_error",
+			},
+			"hint": "OpenAI base_url = http://" + displayListen(s.cfg.Listen) + "/v1 （带不带 /v1 都可以）；" +
+				"可用接口：GET /v1/models、POST /v1/chat/completions、GET /api/status",
+		})
 		return
 	}
 	models, _ := s.pool.Models(r.Context())

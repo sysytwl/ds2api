@@ -22,6 +22,11 @@ const (
 	streamIdleTimeout = 120 * time.Second
 	maxJSONBody       = 4 << 20
 	requestTimeout    = 60 * time.Second
+
+	// The chat websocket gateway can drop a new socket while the previous chat
+	// connection is still being reaped server side; retry opening the stream.
+	chatStartAttempts = 3
+	chatStartBackoff  = 400 * time.Millisecond
 )
 
 var (
@@ -295,6 +300,38 @@ func (c *Client) ChatID(ctx context.Context, cookie string) (string, error) {
 	return out.ChatID, nil
 }
 
+// NewChat asks ELM for a fresh chat id. Each API request gets its own chat so
+// requests never mix histories and never disturb the chat open in a browser.
+func (c *Client) NewChat(ctx context.Context, cookie string) (string, error) {
+	cookie, err := validateCookie(cookie)
+	if err != nil {
+		return "", err
+	}
+	var raw map[string]any
+	if err := c.doJSON(ctx, http.MethodGet, "/api/new-chat", cookie, nil, nil, &raw); err != nil {
+		return "", err
+	}
+	if id := chatIDFromMap(raw); id != "" {
+		return id, nil
+	}
+	if nested, ok := raw["chat"].(map[string]any); ok {
+		if id := chatIDFromMap(nested); id != "" {
+			return id, nil
+		}
+	}
+	// Fall back to the session's current chat when the endpoint returns no id.
+	return c.ChatID(ctx, cookie)
+}
+
+func chatIDFromMap(raw map[string]any) string {
+	for _, key := range []string{"chatId", "chatID", "id"} {
+		if v, ok := raw[key].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
 // Settings reads the session settings map.
 func (c *Client) Settings(ctx context.Context, cookie string) (map[string]any, error) {
 	cookie, err := validateCookie(cookie)
@@ -349,6 +386,14 @@ func (c *Client) SetModel(ctx context.Context, cookie, model string) error {
 // StreamChat sends one prompt to the ELM web chat and calls onDelta for every
 // streamed chunk until the chat finishes. A non-empty model switches the
 // session model first. onDelta returning an error aborts the stream.
+// StreamChat sends one prompt to the ELM web chat and calls onDelta for every
+// streamed chunk until the chat finishes. A non-empty model switches the
+// session model first. onDelta returning an error aborts the stream.
+//
+// The ELM websocket gateway occasionally drops a brand-new chat socket when the
+// previous chat connection has not been reaped server side yet. Because nothing
+// has been sent to the model at that point, opening the chat stream is retried
+// a few times with a short backoff.
 func (c *Client) StreamChat(ctx context.Context, cookie, chatID, prompt, model string, onDelta func(DeltaKind, string) error) error {
 	cookie, err := validateCookie(cookie)
 	if err != nil {
@@ -364,7 +409,7 @@ func (c *Client) StreamChat(ctx context.Context, cookie, chatID, prompt, model s
 		}
 	}
 	if strings.TrimSpace(chatID) == "" {
-		chatID, err = c.ChatID(ctx, cookie)
+		chatID, err = c.NewChat(ctx, cookie)
 		if err != nil {
 			return err
 		}
@@ -373,9 +418,22 @@ func (c *Client) StreamChat(ctx context.Context, cookie, chatID, prompt, model s
 	if err != nil {
 		return err
 	}
-	ws, err := dialWebSocket(ctx, c.wsURL(), map[string]string{"Cookie": cookie, "Origin": c.baseURL})
-	if err != nil {
-		return err
+
+	var ws *wsConn
+	for attempt := 0; ; attempt++ {
+		ws, err = c.openChatStream(ctx, cookie, chatID, prompt, headerName, csrfToken)
+		if err == nil {
+			break
+		}
+		if attempt+1 >= chatStartAttempts || ctx.Err() != nil {
+			return err
+		}
+		delay := chatStartBackoff * time.Duration(attempt+1)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
 	}
 	defer func() { _ = ws.Close() }()
 
@@ -389,6 +447,23 @@ func (c *Client) StreamChat(ctx context.Context, cookie, chatID, prompt, model s
 		}
 	}()
 
+	return c.readChatStream(ctx, ws, onDelta)
+}
+
+// openChatStream dials the chat websocket, performs the STOMP handshake,
+// subscribes to the chat topic and submits the prompt.
+func (c *Client) openChatStream(ctx context.Context, cookie, chatID, prompt, headerName, csrfToken string) (*wsConn, error) {
+	ws, err := dialWebSocket(ctx, c.wsURL(), map[string]string{"Cookie": cookie, "Origin": c.baseURL})
+	if err != nil {
+		return nil, err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = ws.Close()
+		}
+	}()
+
 	connectHeaders := []stompHeader{
 		{Key: "accept-version", Value: "1.2,1.1,1.0"},
 		{Key: "heart-beat", Value: "0,0"},
@@ -398,25 +473,25 @@ func (c *Client) StreamChat(ctx context.Context, cookie, chatID, prompt, model s
 		connectHeaders = append(connectHeaders, stompHeader{Key: headerName, Value: csrfToken})
 	}
 	if err := ws.WriteMessage(encodeStompFrame("CONNECT", connectHeaders, "")); err != nil {
-		return fmt.Errorf("elm: stomp connect: %w", err)
+		return nil, fmt.Errorf("elm: stomp connect: %w", err)
 	}
 	_ = ws.SetReadDeadline(time.Now().Add(connectTimeout))
 	for {
 		msg, err := ws.ReadMessage()
 		if err != nil {
-			return fmt.Errorf("elm: stomp handshake: %w", err)
+			return nil, fmt.Errorf("elm: stomp handshake: %w", err)
 		}
-		frame, ok, err := parseStompFrame(msg)
+		frame, okFrame, err := parseStompFrame(msg)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if !ok {
+		if !okFrame {
 			continue
 		}
 		switch frame.Command {
 		case "CONNECTED":
 		case "ERROR":
-			return fmt.Errorf("elm: stomp connect rejected: %s", frame.Header("message"))
+			return nil, fmt.Errorf("elm: stomp connect rejected: %s", frame.Header("message"))
 		default:
 			continue
 		}
@@ -427,20 +502,25 @@ func (c *Client) StreamChat(ctx context.Context, cookie, chatID, prompt, model s
 		{Key: "id", Value: "sub-0"},
 		{Key: "destination", Value: "/topic/query-" + chatID},
 	}, "")); err != nil {
-		return fmt.Errorf("elm: stomp subscribe: %w", err)
+		return nil, fmt.Errorf("elm: stomp subscribe: %w", err)
 	}
 	queryBody, err := json.Marshal(map[string]any{"query": prompt, "promptId": nil})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := ws.WriteMessage(encodeStompFrame("SEND", []stompHeader{
 		{Key: "destination", Value: "/app/queue/query-" + chatID},
 		{Key: "content-type", Value: "application/json"},
 		{Key: "content-length", Value: strconv.Itoa(len(queryBody))},
 	}, string(queryBody))); err != nil {
-		return fmt.Errorf("elm: stomp send: %w", err)
+		return nil, fmt.Errorf("elm: stomp send: %w", err)
 	}
+	ok = true
+	return ws, nil
+}
 
+// readChatStream consumes chat events until the chat finishes.
+func (c *Client) readChatStream(ctx context.Context, ws *wsConn, onDelta func(DeltaKind, string) error) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err

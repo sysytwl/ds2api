@@ -22,6 +22,7 @@ type Upstream interface {
 	Quota(ctx context.Context, cookie string) (elmcore.Quota, error)
 	Models(ctx context.Context, cookie string) ([]elmcore.Model, error)
 	ChatID(ctx context.Context, cookie string) (string, error)
+	NewChat(ctx context.Context, cookie string) (string, error)
 	SetModel(ctx context.Context, cookie, model string) error
 	CurrentModel(ctx context.Context, cookie string) (string, error)
 	StreamChat(ctx context.Context, cookie, chatID, prompt, model string, onDelta func(elmcore.DeltaKind, string) error) error
@@ -447,12 +448,21 @@ func (p *Pool) Chat(ctx context.Context, model, prompt string, onDelta func(elmc
 	atomic.AddInt64(&s.active, 1)
 	defer atomic.AddInt64(&s.active, -1)
 
-	chatID, err := p.up.ChatID(ctx, s.Cookie)
+	// A fresh chat per request keeps API traffic out of the chat the user has
+	// open in the browser and stops concurrent requests from sharing one thread.
+	chatID, err := p.up.NewChat(ctx, s.Cookie)
 	if err != nil {
 		if errors.Is(err, elmcore.ErrSessionExpired) {
 			s.markExpired(true)
+			return err
 		}
-		return err
+		chatID, err = p.up.ChatID(ctx, s.Cookie)
+		if err != nil {
+			if errors.Is(err, elmcore.ErrSessionExpired) {
+				s.markExpired(true)
+			}
+			return err
+		}
 	}
 
 	s.SwitchMu.Lock()

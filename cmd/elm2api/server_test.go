@@ -48,7 +48,8 @@ func (f *fakeUpstream) Quota(context.Context, string) (elmcore.Quota, error) {
 func (f *fakeUpstream) Models(context.Context, string) ([]elmcore.Model, error) {
 	return f.models, nil
 }
-func (f *fakeUpstream) ChatID(context.Context, string) (string, error) { return "chat-1", nil }
+func (f *fakeUpstream) ChatID(context.Context, string) (string, error)  { return "chat-1", nil }
+func (f *fakeUpstream) NewChat(context.Context, string) (string, error) { return "new-chat-1", nil }
 func (f *fakeUpstream) SetModel(_ context.Context, _ string, model string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -12,6 +12,7 @@
 - **按请求切换模型**：`/v1/chat/completions` 的 `model` 可以是任意 ELM 模型 id，也支持名称/简写（如 `Qwen 3.5 397B`、`qwen-3.5`、`llama-3.3`）；也可通过 `PUT /api/sessions/{id}/model` 给某个会话固定模型。
 - **并发**：全局并发上限（默认 4）由信号量控制；同一模型可真正并行；不同模型只在"切模型 → 提交提问 → 收到首个增量"这一小段串行，实测 3 路并行 3 条回答 1.45s 完成。
 - **流式/非流式**：`stream:true` 输出标准 SSE（含 `[DONE]`），thinking 内容以 `reasoning_content` 增量输出；`stream:false` 聚合返回。
+- **请求间互不干扰**：每个 API 请求都会向 ELM 申请一个**新的 chat**（`GET /api/new-chat`），不会混进浏览器里打开的那个聊天，也不会把多个请求串到同一段上下文里；如果上游没有这个接口，会自动退回使用当前 chat。
 
 ## 2. 快速开始
 
@@ -30,6 +31,9 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 ```
 
 浏览器打开 <http://127.0.0.1:8787> 可以看到：已登录会话、预算、当前模型、全部模型列表，并可粘贴 cookie 登录/切换模型。
+
+客户端里的 `base_url` 写 `http://127.0.0.1:8787/v1` 或 `http://127.0.0.1:8787`（带不带 `/v1`、末尾带不带 `/` 都支持）；
+`api_key` 没有配置 `api_keys` 时随便填即可（例如 `sk-elm`），不会报 “API key wrong”。
 
 ## 3. 配置
 
@@ -78,6 +82,7 @@ ELM 的模型是**会话级设置**（`PUT /api/settings` 的 `model`），聊�
 - 单会话里不同模型的请求会在"切换模型 → 提交 → 收到首个 token"之间串行（拿到首个增量后即释放锁，实测不影响在途回答的模型）。
 - 想彻底避免互相影响：为不同模型各配一个 `SESSION` cookie（同一账号多次登录即可），池会优先把请求路由到已在该模型的会话。
 - 切换会同步影响用同一 cookie 的网页端当前模型；本服务在测试结束会切回原模型。
+- 每个请求都会新建一个 ELM chat（见第 1 节），所以 API 请求不会和网页端正在聊的那条记录混在一起；需要多轮上下文时，把历史消息一起放进 `messages` 即可。
 
 ## 6. cookie 过期与重新登录（shell 会明确提示）
 
@@ -108,7 +113,18 @@ ELM 的 `SESSION` cookie 会过期（登出、服务端会话到期、改密码�
 - cookie 即账号凭证，等同于密码；不要提交仓库或发到聊天里。
 - 并发上限受 ELM 后端实际承载影响，建议从 2–4 开始压测。
 
-## 8. 构建与分发
+## 8. 排错（404 / API key / 空回复 / 串台）
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| `GET /v1/models` 返回 **404** | 客户端把 base_url 拼成了别的路径（例如 base_url 写成 `.../v1/chat/completions`，或旧版本不接受 `/models`、结尾 `/`） | 新版本同时支持 `/v1/models`、`/models` 和末尾 `/`；base_url 只写到 `http://127.0.0.1:8787` 或 `http://127.0.0.1:8787/v1`。仍 404 时响应体会直接写出收到的 `method + path` 和可用接口 |
+| `API key wrong` | 用的是 ds2api 的 `DS2API_ADMIN_KEY` 逻辑 | elm2api 默认**不校验** key；只有 `config.json` 里 `api_keys` 非空时才校验 `Authorization: Bearer <key>` |
+| `EMPTY_RESPONSE` / "completed response with no content" | ELM 网页端偶发把新 websocket 断开（日志会出现 `wsasend ... forcibly closed`），旧版本已经先发了 200 再失败，客户端只看到空内容 | 新版本：① 建立聊天流失败会自动重试 3 次；② 拿到第一个增量前不发送 SSE 头，失败时返回真正的 4xx/5xx；③ 真的空回复返回 `empty_upstream_response` + `hint`，客户端重试即可 |
+| 回答出现在浏览器打开的聊天里 / 多个请求串在一起 | 旧版本复用会话当前的 chat | 新版本每个请求都新建 chat（`GET /api/new-chat`） |
+
+模型列表在网页端是 31 个；如果只看到 DeepSeek 模型，说明启动的是旧的 `ds2api-elm-*.exe`，不是 `elm2api`。
+
+## 9. 构建与分发
 
 ```bash
 go build -o elm2api ./cmd/elm2api          # Go 1.26
