@@ -1,0 +1,12 @@
+{
+  "listen": "127.0.0.1:8787",
+  "base_url": "https://elm.edina.ac.uk",
+  "sessions": [],
+  "default_model": "Qwen/Qwen3.5-397B-A17B-FP8",
+  "max_concurrency": 4,
+  "queue_wait_seconds": 30,
+  "api_keys": [],
+  "model_list_ttl_seconds": 300,
+  "check_interval_seconds": 300,
+  "state_file": "elm2api-state.json"
+}

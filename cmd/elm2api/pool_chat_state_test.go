@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"ds2api/internal/elmcore"
+	"elm2api/internal/elmcore"
 )
 
 // eol keeps the test prompts readable without embedded escape sequences.

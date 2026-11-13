@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"ds2api/internal/elmcore"
+	"elm2api/internal/elmcore"
 )
 
 type fakeUpstream struct {
@@ -35,6 +35,8 @@ type fakeUpstream struct {
 	// failChatID, when set, restricts failChat to one chat id (a chat that was
 	// deleted in the web UI still answers, the other chats do not).
 	failChatID string
+	// reply replaces the default "hello" answer (used to script tool calls).
+	reply string
 }
 
 func (f *fakeUpstream) IsLoggedIn(context.Context, string) (bool, error) {
@@ -107,6 +109,13 @@ func (f *fakeUpstream) StreamChat(ctx context.Context, _ string, chatID string, 
 	}
 	if err := onDelta(elmcore.DeltaThinking, "thinking"); err != nil {
 		return err
+	}
+	if f.reply != "" {
+		half := len(f.reply) / 2
+		if err := onDelta(elmcore.DeltaContent, f.reply[:half]); err != nil {
+			return err
+		}
+		return onDelta(elmcore.DeltaContent, f.reply[half:])
 	}
 	if err := onDelta(elmcore.DeltaContent, "he"); err != nil {
 		return err

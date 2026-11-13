@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"ds2api/internal/elmcore"
+	"elm2api/internal/elmcore"
 )
 
 const maxRequestBody = 8 << 20
@@ -300,11 +300,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	prompt, err := buildPrompt(req.Messages)
+	tools := parseTools(req.Tools)
+	choice, forced := toolChoice(req.ToolChoice)
+	prompt, err := buildPromptWithOptions(req.Messages, promptOptions{Tools: tools, Choice: choice, Forced: forced})
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorPayload(err.Error(), "invalid_request"))
 		return
 	}
+	toolsEnabled := len(tools) > 0 && choice != "none"
 	displayModel := strings.TrimSpace(req.Model)
 	if displayModel == "" {
 		displayModel = resolved
@@ -312,6 +315,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	id := newCompletionID()
 	created := timeNowUnix()
 	if req.Stream {
+		if toolsEnabled {
+			s.streamToolCompletion(w, r, id, displayModel, resolved, prompt, created, tools)
+			return
+		}
 		s.streamCompletion(w, r, id, displayModel, resolved, prompt, created)
 		return
 	}
@@ -332,7 +339,72 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		s.writeEmptyReplyError(w, len(prompt))
 		return
 	}
+	if toolsEnabled {
+		if calls, rest := parseToolCalls(content.String(), tools); len(calls) > 0 {
+			writeJSON(w, http.StatusOK, toolCompletionPayload(id, displayModel, calls, rest))
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, completionPayload(id, displayModel, content.String(), thinking.String()))
+}
+
+// streamToolCompletion buffers the reply, because a text tool call can only be
+// recognised once the whole JSON block arrived. The buffered text is then
+// replayed as one delta, or converted into OpenAI tool_calls.
+func (s *Server) streamToolCompletion(w http.ResponseWriter, r *http.Request, id, displayModel, resolved, prompt string, created int64, tools []toolSpec) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, errorPayload("streaming unsupported", "internal_error"))
+		return
+	}
+	var content, thinking strings.Builder
+	err := s.pool.Chat(r.Context(), resolved, prompt, func(kind elmcore.DeltaKind, text string) error {
+		if kind == elmcore.DeltaThinking {
+			thinking.WriteString(text)
+			return nil
+		}
+		content.WriteString(text)
+		return nil
+	})
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		s.writeUpstreamError(w, err)
+		return
+	}
+	if content.Len() == 0 && thinking.Len() == 0 {
+		s.writeEmptyReplyError(w, len(prompt))
+		return
+	}
+	emit := func(payload map[string]any) {
+		if writeErr := ssePayload(w, payload); writeErr != nil {
+			log.Printf("stream write failed: %v", writeErr)
+		}
+		flusher.Flush()
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	if thinking.Len() > 0 {
+		emit(chunkPayload(id, displayModel, created, map[string]any{"role": "assistant", "reasoning_content": thinking.String()}))
+	}
+	calls, rest := parseToolCalls(content.String(), tools)
+	if len(calls) > 0 {
+		delta := map[string]any{"role": "assistant", "content": nil, "tool_calls": streamingToolCalls(calls)}
+		if strings.TrimSpace(rest) != "" {
+			delta["content"] = rest
+		}
+		emit(chunkPayload(id, displayModel, created, delta))
+		emit(finishChunkPayload(id, displayModel, created, "tool_calls"))
+	} else {
+		emit(chunkPayload(id, displayModel, created, map[string]any{"role": "assistant", "content": content.String()}))
+		emit(finishChunkPayload(id, displayModel, created, "stop"))
+	}
+	_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	flusher.Flush()
 }
 
 func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, id, displayModel, resolved, prompt string, created int64) {

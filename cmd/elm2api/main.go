@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"ds2api/internal/elmcore"
+	"elm2api/internal/elmcore"
 )
 
 func main() {

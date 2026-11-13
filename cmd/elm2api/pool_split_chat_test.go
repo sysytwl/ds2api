@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"ds2api/internal/elmcore"
+	"elm2api/internal/elmcore"
 )
 
 func TestPoolChatSplitsLongPrompt(t *testing.T) {

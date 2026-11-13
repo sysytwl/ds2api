@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"ds2api/internal/elmcore"
+	"elm2api/internal/elmcore"
 )
 
 // responsesRequest is the subset of the OpenAI Responses API the bridge
@@ -23,6 +23,8 @@ type responsesRequest struct {
 	Model              string          `json:"model"`
 	Input              json.RawMessage `json:"input"`
 	Instructions       string          `json:"instructions"`
+	Tools              json.RawMessage `json:"tools"`
+	ToolChoice         json.RawMessage `json:"tool_choice"`
 	PreviousResponseID string          `json:"previous_response_id"`
 	Store              *bool           `json:"store"`
 	Stream             bool            `json:"stream"`
@@ -34,11 +36,13 @@ type responsesRequest struct {
 func (r responsesRequest) storable() bool { return r.Store == nil || *r.Store }
 
 type responsesItem struct {
-	Type    string          `json:"type"`
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
-	Output  json.RawMessage `json:"output"`
-	Name    string          `json:"name"`
+	Type      string          `json:"type"`
+	Role      string          `json:"role"`
+	Content   json.RawMessage `json:"content"`
+	Output    json.RawMessage `json:"output"`
+	Name      string          `json:"name"`
+	CallID    string          `json:"call_id"`
+	Arguments json.RawMessage `json:"arguments"`
 }
 
 func newResponseID() string { return newPrefixedID("resp") }
@@ -55,15 +59,7 @@ func newPrefixedID(prefix string) string {
 
 // responsesMessages normalises the Responses input into chat messages.
 func responsesMessages(req responsesRequest) ([]chatMessage, error) {
-	var msgs []chatMessage
-	if instructions := strings.TrimSpace(req.Instructions); instructions != "" {
-		msgs = append(msgs, chatMessage{Role: "system", Content: mustJSON(instructions)})
-	}
-	items, err := parseResponseInput(req.Input)
-	if err != nil {
-		return nil, err
-	}
-	return append(msgs, items...), nil
+	return parseResponseInput(req.Input)
 }
 
 func parseResponseInput(raw json.RawMessage) ([]chatMessage, error) {
@@ -118,7 +114,18 @@ func (i responsesItem) chatMessage() (chatMessage, bool) {
 		if text == "" {
 			return chatMessage{}, false
 		}
-		return chatMessage{Role: "tool", Content: mustJSON(text)}, true
+		return chatMessage{Role: "tool", ToolCallID: i.CallID, Content: mustJSON(text)}, true
+	case "function_call":
+		if strings.TrimSpace(i.Name) == "" {
+			return chatMessage{}, false
+		}
+		call := chatToolCall{ID: i.CallID}
+		call.Function.Name = i.Name
+		call.Function.Arguments = strings.TrimSpace(string(i.Arguments))
+		if call.Function.Arguments == "" {
+			call.Function.Arguments = "{}"
+		}
+		return chatMessage{Role: "assistant", ToolCalls: []chatToolCall{call}}, true
 	default:
 		return chatMessage{}, false
 	}
@@ -185,11 +192,19 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorPayload(err.Error(), "invalid_request"))
 		return
 	}
-	prompt, err := buildPrompt(messages)
+	tools := parseTools(req.Tools)
+	choice, forced := toolChoice(req.ToolChoice)
+	prompt, err := buildPromptWithOptions(messages, promptOptions{
+		Instructions: req.Instructions,
+		Tools:        tools,
+		Choice:       choice,
+		Forced:       forced,
+	})
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorPayload(err.Error(), "invalid_request"))
 		return
 	}
+	toolsEnabled := len(tools) > 0 && choice != "none"
 	displayModel := strings.TrimSpace(req.Model)
 	if displayModel == "" {
 		displayModel = resolved
@@ -206,6 +221,10 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	id := newResponseID()
 	created := time.Now().Unix()
 	if req.Stream {
+		if toolsEnabled {
+			s.streamResponseWithTools(w, r, id, displayModel, resolved, prompt, chatID, store, req.PreviousResponseID, tools)
+			return
+		}
 		s.streamResponse(w, r, id, displayModel, resolved, prompt, chatID, store, req.PreviousResponseID)
 		return
 	}
@@ -232,6 +251,21 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	output := []map[string]any{}
 	if reasoning := thinking.String(); reasoning != "" {
 		output = append(output, reasoningItem(newItemID("rs"), reasoning))
+	}
+	if toolsEnabled {
+		if calls, rest := parseToolCalls(content.String(), tools); len(calls) > 0 {
+			output = append(output, functionCallItems(calls)...)
+			if strings.TrimSpace(rest) != "" {
+				output = append(output, messageItem(newItemID("msg"), rest))
+			}
+			payload := responseObject(id, displayModel, created, "completed", store, output, prompt, content.String()+thinking.String())
+			payload["previous_response_id"] = nil
+			if prev := strings.TrimSpace(req.PreviousResponseID); prev != "" {
+				payload["previous_response_id"] = prev
+			}
+			writeJSON(w, http.StatusOK, payload)
+			return
+		}
 	}
 	output = append(output, messageItem(newItemID("msg"), content.String()))
 	payload := responseObject(id, displayModel, created, "completed", store, output, prompt, content.String()+thinking.String())
@@ -452,4 +486,120 @@ func sseEvent(w io.Writer, event string, payload map[string]any) error {
 		return err
 	}
 	return nil
+}
+
+// functionCallItems renders Responses API function_call output items.
+func functionCallItems(calls []invokedTool) []map[string]any {
+	out := make([]map[string]any, 0, len(calls))
+	for _, call := range calls {
+		out = append(out, map[string]any{
+			"id":        newItemID("fc"),
+			"type":      "function_call",
+			"status":    "completed",
+			"call_id":   newPrefixedID("call"),
+			"name":      call.Name,
+			"arguments": call.Arguments,
+		})
+	}
+	return out
+}
+
+// streamResponseWithTools buffers the reply (a text tool call is only complete
+// once its JSON block arrived) and then emits function_call items.
+func (s *Server) streamResponseWithTools(w http.ResponseWriter, r *http.Request, id, displayModel, resolved, prompt, chatID string, store bool, previousID string, tools []toolSpec) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, errorPayload("streaming unsupported", "internal_error"))
+		return
+	}
+	created := time.Now().Unix()
+	var content, thinking strings.Builder
+	usedChat, sessionID, err := s.pool.ChatIn(r.Context(), resolved, prompt, chatID, func(kind elmcore.DeltaKind, text string) error {
+		if kind == elmcore.DeltaThinking {
+			thinking.WriteString(text)
+			return nil
+		}
+		content.WriteString(text)
+		return nil
+	})
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		s.writeUpstreamError(w, err)
+		return
+	}
+	if content.Len() == 0 && thinking.Len() == 0 {
+		s.writeEmptyReplyError(w, len(prompt))
+		return
+	}
+	if store {
+		s.rememberResponse(id, usedChat, sessionID, resolved)
+	}
+	calls, rest := parseToolCalls(content.String(), tools)
+	sequence := 0
+	emit := func(event string, payload map[string]any) {
+		payload["type"] = event
+		payload["sequence_number"] = sequence
+		sequence++
+		if writeErr := sseEvent(w, event, payload); writeErr != nil {
+			log.Printf("responses stream write failed: %v", writeErr)
+		}
+		flusher.Flush()
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	emit("response.created", map[string]any{"response": responseObject(id, displayModel, created, "in_progress", store, []map[string]any{}, "", "")})
+
+	output := []map[string]any{}
+	index := 0
+	if reasoning := thinking.String(); reasoning != "" {
+		item := reasoningItem(newItemID("rs"), reasoning)
+		output = append(output, item)
+		emit("response.output_item.added", map[string]any{"output_index": index, "item": item})
+		emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
+		index++
+	}
+	if len(calls) > 0 {
+		for _, call := range calls {
+			item := functionCallItems([]invokedTool{call})[0]
+			output = append(output, item)
+			emit("response.output_item.added", map[string]any{"output_index": index, "item": item})
+			emit("response.function_call_arguments.delta", map[string]any{
+				"item_id": item["id"], "output_index": index, "delta": call.Arguments,
+			})
+			emit("response.function_call_arguments.done", map[string]any{
+				"item_id": item["id"], "output_index": index, "arguments": call.Arguments,
+			})
+			emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
+			index++
+		}
+		if strings.TrimSpace(rest) != "" {
+			item := messageItem(newItemID("msg"), rest)
+			output = append(output, item)
+			emit("response.output_item.added", map[string]any{"output_index": index, "item": item})
+			emit("response.output_text.delta", map[string]any{
+				"item_id": item["id"], "output_index": index, "content_index": 0, "delta": rest,
+			})
+			emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
+			index++
+		}
+	} else {
+		item := messageItem(newItemID("msg"), content.String())
+		output = append(output, item)
+		emit("response.output_item.added", map[string]any{"output_index": index, "item": item})
+		emit("response.output_text.delta", map[string]any{
+			"item_id": item["id"], "output_index": index, "content_index": 0, "delta": content.String(),
+		})
+		emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
+	}
+	final := responseObject(id, displayModel, created, "completed", store, output, prompt, content.String()+thinking.String())
+	final["previous_response_id"] = nil
+	if prev := strings.TrimSpace(previousID); prev != "" {
+		final["previous_response_id"] = prev
+	}
+	emit("response.completed", map[string]any{"response": final})
 }

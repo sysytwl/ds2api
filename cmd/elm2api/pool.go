@@ -14,7 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"ds2api/internal/elmcore"
+	"elm2api/internal/elmcore"
 )
 
 // Upstream is the ELM backend used by the pool (elmcore.Client in production).

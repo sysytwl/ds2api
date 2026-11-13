@@ -15,6 +15,7 @@
 - **对话连续、聊天可追溯**：把网页聊天当上下文存储——每段对话对应一个 ELM chat，续聊时只把**新增的那一轮**发给 ELM，网页里能直接看到每次 API 对话。换模型**不**新建 chat（ELM 的模型是会话级设置）；只有客户端重发的内容对不上任何已知对话（编辑/回滚/换话题）或换 session 时才新建 chat。
 - **可同时保留多段对话**：一个 session 记住最近 8 个 chat（主对话、subagent 等），谁续聊就回到谁的 chat，不会串台。
 - **Responses API**：`POST /v1/responses` 支持 `previous_response_id`——响应 id 映射到 ELM chat，客户端只发新增输入即可继续；id 失效（网页里删了 chat、state 被重置）自动新建 chat；`store:false` 暂不支持续聊，按“每次新建 chat”处理。
+- **工具调用**：`tools` / `tool_choice` 可用。ELM 网页没有原生 function calling，服务把工具定义写进 prompt，再把模型输出的 JSON 调用翻译成标准 `tool_calls`（Chat Completions）或 `function_call`（Responses）。
 
 ## 2. 快速开始
 
@@ -112,7 +113,36 @@ ELM 的模型是**会话级设置**（`PUT /api/settings` 的 `model`），聊�
 
 `state_file` 只保存 chat id、模型、prompt 长度/哈希和 120 字预览，重启后仍能接上原来的聊天；`GET /api/status` 与首页会列出每个 session 记住的 chat。
 
-## 7. cookie 过期与重新登录（shell 会明确提示）
+## 7. 工具调用（文本协议 → tool_calls）
+
+ELM 的网页聊天只能收发文本，没有原生 function calling。服务的做法是：
+
+1. 把 `tools` 的 name / description / JSON Schema 写进 prompt 开头，并要求模型**需要调用时只输出一个 JSON 代码块**：
+
+   ```json
+   {"tool_calls":[{"name":"pwsh","arguments":{"command":"git status"}}]}
+   ```
+
+2. 收到回复后解析这段调用，转成标准 OpenAI 结构：Chat Completions 返回 `message.tool_calls` + `finish_reason:"tool_calls"`；Responses 返回 `function_call` 输出项。
+3. 客户端把工具结果以 `role:"tool"`（Responses 里是 `function_call_output`）发回时，服务渲染成 `Tool result (<工具名>): ...` 继续对话。
+
+兼容的模型输出格式（解析器都接受）：JSON 代码块、裸 JSON、`<tool_call>...</tool_call>`，以及部分模型会写的 YAML 形式：
+
+```
+pwsh
+description: Show git working tree status
+command: git status
+workdir: C:/work
+```
+
+行为细节：
+
+- `tool_choice: "none"` 时不注入协议、也不解析；`tool_choice` 指定某个函数时会要求模型必须调用它。
+- **流式请求带 tools 时会先缓冲整段回复**（否则无法判断 JSON 调用是否完整），结束后一次性发出文本或 `tool_calls`；不带 tools 的请求仍然逐字流式输出。
+- 参数由模型生成，客户端仍应校验 schema；模型偶尔可能把调用写成普通文本，此时按普通回答返回。
+- 工具结果过长同样受 16K 消息上限约束，会被自动分段。
+
+## 8. cookie 过期与重新登录（shell 会明确提示）
 
 ELM 的 `SESSION` cookie 会过期（登出、服务端会话到期、改密码等）。服务不会静默失败，而是在**终端日志**里直接给出处理方式，并在接口/页面里同步提示：
 
@@ -134,15 +164,16 @@ ELM 的 `SESSION` cookie 会过期（登出、服务端会话到期、改密码�
 - **重新登录无需重启**：`POST /api/sessions` 传入新 cookie 即生效；旧会话条目可 `DELETE /api/sessions/{id}` 移除。
 - `GET /api/status` 的 `warnings` 字段和网页首页红条会同步展示过期会话。
 
-## 8. 限制
+## 9. 限制
 
-- 只支持纯文本对话；`tools`/`tool_choice`、文件上传、图片输入未实现（ELM 网页接口可以扩展，但当前版本未做）；Responses 里的 `function_call` 会被忽略。
+- 只支持纯文本对话；文件上传、图片输入未实现。工具调用是通过 prompt 协议模拟的（见上一节），不是原生 function calling。
+- `POST /v1/responses` 的 `tools` 支持 function 类型；其他内置工具类型会被忽略。
 - **一个账号同一时刻只能跑一个聊天**：并发请求会排队，这是 ELM 侧的限制，不是本服务的开关。
 - Responses 的 `usage` 是按字符估算的（ELM 网页端不返回 token 用量）；`store:false` 不支持续聊，等价于每次新建 chat。
 - 非 Hosted 模型（Claude/GPT/Gemini 等）会消耗 ELM 个人预算；Web Search 等工具费用同样计入。
 - cookie 即账号凭证，等同于密码；不要提交仓库或发到聊天里。
 
-## 9. 排错（404 / API key / 空回复 / 排队）
+## 10. 排错（404 / API key / 空回复 / 排队）
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
@@ -152,12 +183,13 @@ ELM 的 `SESSION` cookie 会过期（登出、服务端会话到期、改密码�
 | 回答出现在浏览器打开的聊天里 | 预期行为：API 是把网页聊天伪装成 API | 复用该对话的 chat，历史留在网页端可查；换模型不新建 chat，只有回滚/新对话/换 session 才会新建 |
 | 第二个请求很慢，或日志出现 `queueing request` | 一个 ELM 账号同一时刻只能跑一个聊天，第二个对话要等第一个结束 | 正常排队；要并行就配多个账号的 cookie |
 | 长 prompt（如 coding agent 的 system prompt）直接返回空回复 | ELM 网页端单条消息上限约 **16K 字符**，超长消息会被上游直接丢弃 | 服务会自动把过长 prompt 按行切成多条消息依次发送（同一 chat，仅最后一条的输出返回给客户端）；如果仍然失败会返回 413 `prompt_too_long` 并给出实际字符数 |
+| 模型把工具调用写成了普通文本 | 模型没按协议输出 JSON（小模型或长 prompt 时更常见） | 回复按普通文本返回；可以重试、换更强的模型，或检查客户端是否真的传了 `tools` |
 | `previous_response_id` 失效 / 网页里把 chat 删了 | 映射记在 `state_file`，chat 被删或 state 被重置后找不到 | 自动新建 chat 并把这次当作新对话（日志打印 `previous_response_id ... is unknown`）；想接回旧上下文就重发完整历史 |
 | 请求一直被客户端取消 | ELM 网页端在长 prompt / 大历史时首字较慢，客户端超时设得太短 | 把客户端超时调到 120s 以上；`ELM_DEBUG=1` 可看到逐帧日志 |
 
 模型列表在网页端是 31 个；如果只看到 DeepSeek 模型，说明启动的是旧的 `ds2api-elm-*.exe`，不是 `elm2api`。
 
-## 10. 构建与分发
+## 11. 构建与分发
 
 ```bash
 go build -o elm2api ./cmd/elm2api          # Go 1.26
