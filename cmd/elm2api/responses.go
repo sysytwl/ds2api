@@ -194,12 +194,13 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	tools := parseTools(req.Tools)
 	choice, forced := toolChoice(req.ToolChoice)
-	prompt, err := buildPromptWithOptions(messages, promptOptions{
+	opt := promptOptions{
 		Instructions: req.Instructions,
 		Tools:        tools,
 		Choice:       choice,
 		Forced:       forced,
-	})
+	}
+	prompt, err := buildPromptWithOptions(messages, opt)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorPayload(err.Error(), "invalid_request"))
 		return
@@ -220,16 +221,17 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	id := newResponseID()
 	created := time.Now().Unix()
+	tail := continuationTail(opt)
 	if req.Stream {
 		if toolsEnabled {
-			s.streamResponseWithTools(w, r, id, displayModel, resolved, prompt, chatID, store, req.PreviousResponseID, tools)
+			s.streamResponseWithTools(w, r, id, displayModel, resolved, prompt, tail, chatID, store, req.PreviousResponseID, tools)
 			return
 		}
-		s.streamResponse(w, r, id, displayModel, resolved, prompt, chatID, store, req.PreviousResponseID)
+		s.streamResponse(w, r, id, displayModel, resolved, prompt, tail, chatID, store, req.PreviousResponseID)
 		return
 	}
 	var content, thinking strings.Builder
-	usedChat, sessionID, err := s.pool.ChatIn(r.Context(), resolved, prompt, chatID, func(kind elmcore.DeltaKind, text string) error {
+	usedChat, sessionID, err := s.pool.ChatInTail(r.Context(), resolved, prompt, chatID, tail, func(kind elmcore.DeltaKind, text string) error {
 		if kind == elmcore.DeltaThinking {
 			thinking.WriteString(text)
 			return nil
@@ -286,7 +288,7 @@ func (s *Server) rememberResponse(id, chatID, sessionID, model string) {
 }
 
 // streamResponse emits the Responses API event stream.
-func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, id, displayModel, resolved, prompt, chatID string, store bool, previousID string) {
+func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, id, displayModel, resolved, prompt, tail, chatID string, store bool, previousID string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, errorPayload("streaming unsupported", "internal_error"))
@@ -344,7 +346,7 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, id, disp
 		})
 	}
 
-	usedChat, sessionID, err := s.pool.ChatIn(r.Context(), resolved, prompt, chatID, func(kind elmcore.DeltaKind, text string) error {
+	usedChat, sessionID, err := s.pool.ChatInTail(r.Context(), resolved, prompt, chatID, tail, func(kind elmcore.DeltaKind, text string) error {
 		start()
 		if kind == elmcore.DeltaThinking {
 			if reasoningIndex < 0 {
@@ -506,7 +508,7 @@ func functionCallItems(calls []invokedTool) []map[string]any {
 
 // streamResponseWithTools buffers the reply (a text tool call is only complete
 // once its JSON block arrived) and then emits function_call items.
-func (s *Server) streamResponseWithTools(w http.ResponseWriter, r *http.Request, id, displayModel, resolved, prompt, chatID string, store bool, previousID string, tools []toolSpec) {
+func (s *Server) streamResponseWithTools(w http.ResponseWriter, r *http.Request, id, displayModel, resolved, prompt, tail, chatID string, store bool, previousID string, tools []toolSpec) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, errorPayload("streaming unsupported", "internal_error"))
@@ -514,7 +516,7 @@ func (s *Server) streamResponseWithTools(w http.ResponseWriter, r *http.Request,
 	}
 	created := time.Now().Unix()
 	var content, thinking strings.Builder
-	usedChat, sessionID, err := s.pool.ChatIn(r.Context(), resolved, prompt, chatID, func(kind elmcore.DeltaKind, text string) error {
+	usedChat, sessionID, err := s.pool.ChatInTail(r.Context(), resolved, prompt, chatID, tail, func(kind elmcore.DeltaKind, text string) error {
 		if kind == elmcore.DeltaThinking {
 			thinking.WriteString(text)
 			return nil

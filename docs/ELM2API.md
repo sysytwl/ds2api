@@ -135,6 +135,8 @@ command: git status
 workdir: C:/work
 ```
 
+长 prompt 的关键点：coding agent 的 system prompt + 历史很容易超过 16K，此时 prompt 会被切成多条 ELM 消息发送，而工具协议本来只在 prompt 开头。**最后一片（真正被回答的那一条）会重新附带一遍工具协议**，否则模型看到的只有对话尾巴、没有工具定义，就会用自然语言回答"我去执行一下"而不是给出调用。
+
 行为细节：
 
 - `tool_choice: "none"` 时不注入协议、也不解析；`tool_choice` 指定某个函数时会要求模型必须调用它。
@@ -183,7 +185,7 @@ ELM 的 `SESSION` cookie 会过期（登出、服务端会话到期、改密码�
 | 回答出现在浏览器打开的聊天里 | 预期行为：API 是把网页聊天伪装成 API | 复用该对话的 chat，历史留在网页端可查；换模型不新建 chat，只有回滚/新对话/换 session 才会新建 |
 | 第二个请求很慢，或日志出现 `queueing request` | 一个 ELM 账号同一时刻只能跑一个聊天，第二个对话要等第一个结束 | 正常排队；要并行就配多个账号的 cookie |
 | 长 prompt（如 coding agent 的 system prompt）直接返回空回复 | ELM 网页端单条消息上限约 **16K 字符**，超长消息会被上游直接丢弃 | 服务会自动把过长 prompt 按行切成多条消息依次发送（同一 chat，仅最后一条的输出返回给客户端）；如果仍然失败会返回 413 `prompt_too_long` 并给出实际字符数 |
-| 模型把工具调用写成了普通文本 | 模型没按协议输出 JSON（小模型或长 prompt 时更常见） | 回复按普通文本返回；可以重试、换更强的模型，或检查客户端是否真的传了 `tools` |
+| 模型把工具调用写成了普通文本（例如回"我去执行一下"，DSH 里只显示一段 JSON） | 常见原因是 prompt 超过 16K 被切分，工具协议留在了第一片、最后一片没有（已修复：最后一片会重述协议）；其次是模型没按协议输出 | 升级到当前版本；日志里 `tools=N prompt=… reply=… tool_calls=0` 表示确实没解析到调用，`tool_calls>=1` 表示已翻译成标准结构。仍失败可换更强的模型或精简 system prompt |
 | `previous_response_id` 失效 / 网页里把 chat 删了 | 映射记在 `state_file`，chat 被删或 state 被重置后找不到 | 自动新建 chat 并把这次当作新对话（日志打印 `previous_response_id ... is unknown`）；想接回旧上下文就重发完整历史 |
 | 请求一直被客户端取消 | ELM 网页端在长 prompt / 大历史时首字较慢，客户端超时设得太短 | 把客户端超时调到 120s 以上；`ELM_DEBUG=1` 可看到逐帧日志 |
 

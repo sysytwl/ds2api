@@ -490,6 +490,14 @@ func (p *Pool) pick(model string) *Session {
 // session already has: an extending prompt only sends the new turn, an edited
 // or unrelated prompt starts a new ELM chat (the web chat cannot be rewound).
 func (p *Pool) Chat(ctx context.Context, model, prompt string, onDelta func(elmcore.DeltaKind, string) error) error {
+	return p.ChatTail(ctx, model, prompt, "", onDelta)
+}
+
+// ChatTail is Chat with a tail block: when the prompt is too long for one ELM
+// message it is split, and tail is repeated in the final chunk. The tool
+// protocol only exists at the top of the prompt, so without the repeat a long
+// conversation reaches the model with no tool definitions in front of it.
+func (p *Pool) ChatTail(ctx context.Context, model, prompt, tail string, onDelta func(elmcore.DeltaKind, string) error) error {
 	return p.withSession(ctx, model, func(s *Session) error {
 		rec, sendPrompt, err := p.prepareChat(ctx, s, prompt)
 		if err != nil {
@@ -500,7 +508,7 @@ func (p *Pool) Chat(ctx context.Context, model, prompt string, onDelta func(elmc
 			emitted = true
 			return onDelta(kind, text)
 		}
-		err = p.sendPrompt(ctx, s, rec.ID, sendPrompt, model, wrap)
+		err = p.sendPrompt(ctx, s, rec.ID, sendPrompt, tail, model, wrap)
 		if err != nil && !emitted && rec.PrevLen > 0 {
 			// The remembered chat is gone (deleted in the web UI) or unusable;
 			// start a fresh one instead of failing the client.
@@ -510,7 +518,7 @@ func (p *Pool) Chat(ctx context.Context, model, prompt string, onDelta func(elmc
 			}
 			log.Printf("elm2api: chat %s unusable (%v), opened %s instead", rec.ID, err, id)
 			rec = s.noteChat(id, prompt)
-			err = p.sendPrompt(ctx, s, id, prompt, model, wrap)
+			err = p.sendPrompt(ctx, s, id, prompt, tail, model, wrap)
 		}
 		if err != nil {
 			return err
@@ -525,6 +533,11 @@ func (p *Pool) Chat(ctx context.Context, model, prompt string, onDelta func(elmc
 // Responses API, where the conversation is continued by id instead of by
 // resending the prompt.
 func (p *Pool) ChatIn(ctx context.Context, model, prompt, chatID string, onDelta func(elmcore.DeltaKind, string) error) (string, string, error) {
+	return p.ChatInTail(ctx, model, prompt, chatID, "", onDelta)
+}
+
+// ChatInTail is ChatIn with the same tail repeat as ChatTail.
+func (p *Pool) ChatInTail(ctx context.Context, model, prompt, chatID, tail string, onDelta func(elmcore.DeltaKind, string) error) (string, string, error) {
 	used := strings.TrimSpace(chatID)
 	sessionID := ""
 	err := p.withSession(ctx, model, func(s *Session) error {
@@ -544,7 +557,7 @@ func (p *Pool) ChatIn(ctx context.Context, model, prompt, chatID string, onDelta
 		} else {
 			s.noteChat(used, "")
 		}
-		err := p.sendPrompt(ctx, s, used, prompt, model, wrap)
+		err := p.sendPrompt(ctx, s, used, prompt, tail, model, wrap)
 		if err != nil && !emitted {
 			id, chatErr := p.openChat(ctx, s)
 			if chatErr != nil {
@@ -553,7 +566,7 @@ func (p *Pool) ChatIn(ctx context.Context, model, prompt, chatID string, onDelta
 			log.Printf("elm2api: chat %s unusable (%v), opened %s instead", used, err, id)
 			used = id
 			s.noteChat(id, prompt)
-			err = p.sendPrompt(ctx, s, id, prompt, model, wrap)
+			err = p.sendPrompt(ctx, s, id, prompt, tail, model, wrap)
 		}
 		return err
 	})
@@ -644,14 +657,14 @@ func (p *Pool) openChat(ctx context.Context, s *Session) (string, error) {
 
 // sendPrompt writes one prompt into chatID, splitting it when it exceeds the
 // ELM message limit. Only the final chunk's deltas reach onDelta.
-func (p *Pool) sendPrompt(ctx context.Context, s *Session, chatID, prompt, model string, onDelta func(elmcore.DeltaKind, string) error) error {
+func (p *Pool) sendPrompt(ctx context.Context, s *Session, chatID, prompt, tail, model string, onDelta func(elmcore.DeltaKind, string) error) error {
 	sendModel := ""
 	if model != "" && s.Model() != model {
 		sendModel = model
 	}
-	chunks := splitPrompt(prompt, elmMaxPromptChars-len(splitContextPrefix))
+	chunks := splitPromptWithTail(prompt, elmMaxPromptChars-len(splitContextPrefix), tail)
 	if len(chunks) > 1 {
-		log.Printf("elm2api: prompt split into %d messages (%d chars, ELM limit ~%d)", len(chunks), len(prompt), elmMaxPromptChars)
+		log.Printf("elm2api: prompt split into %d messages (%d chars, tail %d chars, ELM limit ~%d)", len(chunks), len(prompt), len(tail), elmMaxPromptChars)
 	}
 	for i, chunk := range chunks {
 		last := i == len(chunks)-1
@@ -708,6 +721,23 @@ func splitPrompt(prompt string, limit int) []string {
 	if remaining != "" {
 		chunks = append(chunks, remaining)
 	}
+	return chunks
+}
+
+// splitPromptWithTail splits prompt into ELM-sized chunks and repeats tail at
+// the start of the final chunk, which is the only one the model answers. The
+// prompt is re-cut with room reserved so the repeated block still fits.
+func splitPromptWithTail(prompt string, limit int, tail string) []string {
+	tail = strings.TrimSpace(tail)
+	chunks := splitPrompt(prompt, limit)
+	if tail == "" || len(chunks) < 2 || len(tail)+2 >= limit {
+		return chunks
+	}
+	if last := chunks[len(chunks)-1]; len(last)+len(tail)+2 > limit {
+		chunks = splitPrompt(prompt, limit-len(tail)-2)
+	}
+	last := chunks[len(chunks)-1]
+	chunks[len(chunks)-1] = tail + "\n\n" + last
 	return chunks
 }
 

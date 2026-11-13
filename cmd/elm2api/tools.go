@@ -98,16 +98,23 @@ func toolChoice(raw json.RawMessage) (string, string) {
 // to travel as text and be translated back into tool_calls by this service.
 func toolInstructions(tools []toolSpec, mode, forced string) string {
 	var b strings.Builder
-	b.WriteString("# 工具调用协议\n")
-	b.WriteString("\n")
-	b.WriteString("你可以调用下列工具。需要调用工具时，**只输出一个 JSON 代码块**，格式为：\n\n")
+	b.WriteString("# 工具调用协议（必须严格遵守）\n\n")
+	b.WriteString("需要调用工具时，整个回答只输出一个 JSON 代码块，前面后面都不要写任何解释：\n\n")
 	b.WriteString("```json\n")
 	b.WriteString("{\"tool_calls\":[{\"name\":\"工具名\",\"arguments\":{\"参数\":\"值\"}}]}")
 	b.WriteString("\n```\n\n")
-	b.WriteString("- arguments 必须符合该工具的 JSON Schema；一次可以给出多个调用。\n")
-	b.WriteString("- 不需要调用工具时，直接用自然语言回答，不要输出这个 JSON 代码块。\n")
-	b.WriteString("- 工具执行结果会以 \"Tool result (<工具名>):\" 的形式出现在后续对话里。\n")
-	b.WriteString("- 不要假装工具已经执行；只有真的需要执行时才输出调用。\n")
+	b.WriteString("规则：\n")
+	b.WriteString("1. 代码块语言标记必须是 json，内容是单个对象，键名是 tool_calls。\n")
+	b.WriteString("2. arguments 必须是 JSON 对象，键名和类型严格符合该工具的 JSON Schema，不要发明字段。\n")
+	b.WriteString("3. 需要多个调用时，把多个 {name, arguments} 放进同一个 tool_calls 数组。\n")
+	b.WriteString("4. 字符串里的换行写成 \\n，不要写成真实换行或 YAML/XML。\n")
+	b.WriteString("5. 工具执行结果会以 \"Tool result (<工具名>):\" 出现在后续对话里；拿到结果后再继续。\n")
+	b.WriteString("6. 不需要调用工具时，直接用自然语言回答，不要输出任何 JSON 代码块。\n")
+	b.WriteString("7. 不要假装工具已经执行，也不要一边说\"我来执行\"一边给代码块；要调用就直接给代码块。\n\n")
+	b.WriteString("反例（都不要这样做）：\n")
+	b.WriteString("- 在代码块前后写\"好的，我来运行 git status\"。\n")
+	b.WriteString("- 用 ```yaml 或 ```xml 写调用，或写成裸 XML。\n")
+	b.WriteString("- 编造参数（例如把 command 写成空字符串）。\n")
 	if forced != "" {
 		b.WriteString(fmt.Sprintf("- 本次请求必须调用工具 %q。\n", forced))
 	} else if mode == "required" {

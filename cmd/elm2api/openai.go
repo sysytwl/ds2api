@@ -71,6 +71,17 @@ type promptOptions struct {
 	Forced       string
 }
 
+// continuationTail is repeated in the last chunk of a split prompt: the tool
+// protocol sits at the very top of the prompt, so a long conversation would
+// otherwise be answered without any tool definitions in front of the model.
+func continuationTail(opt promptOptions) string {
+	if len(opt.Tools) == 0 || opt.Choice == "none" {
+		return ""
+	}
+	return "# 续传提示" + "\n" + "前面的消息是同一段长对话的上下文切片，本轮只需回答最后那条请求。" + "\n\n" +
+		toolInstructions(opt.Tools, opt.Choice, opt.Forced)
+}
+
 // buildPrompt turns an OpenAI message list into the single prompt the ELM web
 // chat accepts.
 func buildPrompt(messages []chatMessage) (string, error) {

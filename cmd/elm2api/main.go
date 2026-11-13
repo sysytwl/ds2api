@@ -99,7 +99,16 @@ func startSessionWatchdog(ctx context.Context, up Upstream, pool *Pool, interval
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				checkSessions(ctx, up, pool, listen)
+				// A panic here would take the whole process down, and the only
+				// job of this loop is health reporting.
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("elm2api: session watchdog panic: %v", r)
+						}
+					}()
+					checkSessions(ctx, up, pool, listen)
+				}()
 			}
 		}
 	}()
