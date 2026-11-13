@@ -7,12 +7,42 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
+
+// debugEnabled turns on low-level frame logging (ELM_DEBUG=1).
+var debugEnabled atomicBool
+
+// atomicBool is a tiny dependency-free switch.
+type atomicBool struct{ v int32 }
+
+func (b *atomicBool) Store(v bool) {
+	if v {
+		atomic.StoreInt32(&b.v, 1)
+		return
+	}
+	atomic.StoreInt32(&b.v, 0)
+}
+
+func (b *atomicBool) Load() bool { return atomic.LoadInt32(&b.v) == 1 }
+
+// SetDebug enables or disables verbose protocol logging.
+func SetDebug(v bool) { debugEnabled.Store(v) }
+
+// DebugEnabled reports whether verbose protocol logging is on.
+func DebugEnabled() bool { return debugEnabled.Load() }
+
+func debugf(format string, args ...any) {
+	if debugEnabled.Load() {
+		log.Printf("elmcore: "+format, args...)
+	}
+}
 
 const (
 	// DefaultBaseURL is the ELM deployment.
@@ -457,6 +487,7 @@ func (c *Client) openChatStream(ctx context.Context, cookie, chatID, prompt, hea
 	if err != nil {
 		return nil, err
 	}
+	debugf("open chat=%s prompt=%d bytes", chatID, len(prompt))
 	ok := false
 	defer func() {
 		if !ok {
@@ -546,8 +577,10 @@ func (c *Client) readChatStream(ctx context.Context, ws *wsConn, onDelta func(De
 		}
 		event, err := parseChatEvent(frame.Body)
 		if err != nil {
+			debugf("unparsed frame: %s", string(frame.Body[:min(len(frame.Body), 200)]))
 			continue
 		}
+		debugf("frame type=%q reply=%d finished=%v", event.ReplyType, len(event.Reply), isFinishedEvent(event))
 		switch {
 		case isFinishedEvent(event):
 			return nil

@@ -326,7 +326,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if content.Len() == 0 && thinking.Len() == 0 {
-		s.writeEmptyReplyError(w, nil)
+		s.writeEmptyReplyError(w, len(prompt))
 		return
 	}
 	writeJSON(w, http.StatusOK, completionPayload(id, displayModel, content.String(), thinking.String()))
@@ -393,10 +393,10 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, id, di
 	}
 	if contentLen == 0 && thinkingLen == 0 {
 		if !started {
-			s.writeEmptyReplyError(w, nil)
+			s.writeEmptyReplyError(w, len(prompt))
 			return
 		}
-		emit(emptyReplyPayload(nil))
+		emit(emptyReplyPayload(len(prompt)))
 		return
 	}
 	start()
@@ -405,19 +405,28 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, id, di
 	flusher.Flush()
 }
 
+// elmMaxPromptChars is the practical size limit of one ELM web-chat message.
+// Bigger prompts are rejected upstream and come back as an empty reply.
+const elmMaxPromptChars = 16000
+
 // emptyReplyPayload is returned when ELM finishes a chat without any text.
-func emptyReplyPayload(err error) map[string]any {
-	message := "ELM returned an empty reply"
-	if err != nil {
-		message = "ELM returned an empty reply: " + err.Error()
+func emptyReplyPayload(promptLen int) map[string]any {
+	if promptLen > elmMaxPromptChars {
+		payload := errorPayload(fmt.Sprintf("prompt is too long for the ELM web chat (%d chars, limit about %d)", promptLen, elmMaxPromptChars), "prompt_too_long")
+		payload["hint"] = fmt.Sprintf("ELM 网页端单条消息上限约 %d 字符，当前 prompt 有 %d 字符；请精简 system prompt 或历史消息后重试", elmMaxPromptChars, promptLen)
+		return payload
 	}
-	payload := errorPayload(message, "empty_upstream_response")
+	payload := errorPayload("ELM returned an empty reply", "empty_upstream_response")
 	payload["hint"] = "ELM 网页端偶发返回空回复（通常是上游 websocket 被临时断开），直接重试即可；若持续出现请检查会话是否被网页端占用"
 	return payload
 }
 
-func (s *Server) writeEmptyReplyError(w http.ResponseWriter, err error) {
-	writeJSON(w, http.StatusBadGateway, emptyReplyPayload(err))
+func (s *Server) writeEmptyReplyError(w http.ResponseWriter, promptLen int) {
+	status := http.StatusBadGateway
+	if promptLen > elmMaxPromptChars {
+		status = http.StatusRequestEntityTooLarge
+	}
+	writeJSON(w, status, emptyReplyPayload(promptLen))
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {

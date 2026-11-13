@@ -6,11 +6,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"ds2api/internal/elmcore"
 )
@@ -477,11 +479,32 @@ func (p *Pool) Chat(ctx context.Context, model, prompt string, onDelta func(elmc
 	if sendModel != "" && s.Model() == sendModel {
 		sendModel = ""
 	}
-	err = p.up.StreamChat(ctx, s.Cookie, chatID, prompt, sendModel, func(kind elmcore.DeltaKind, text string) error {
+	chunks := splitPrompt(prompt, elmMaxPromptChars-len(splitContextPrefix))
+	if len(chunks) > 1 {
+		log.Printf("elm2api: prompt split into %d messages (%d chars, ELM limit ~%d)", len(chunks), len(prompt), elmMaxPromptChars)
+	}
+	for i, chunk := range chunks {
+		last := i == len(chunks)-1
+		body := chunk
+		if !last {
+			body = splitContextPrefix + chunk
+		}
+		sendThis := sendModel
+		if i > 0 {
+			sendThis = ""
+		}
+		err = p.up.StreamChat(ctx, s.Cookie, chatID, body, sendThis, func(kind elmcore.DeltaKind, text string) error {
+			unlock()
+			if !last {
+				return nil
+			}
+			return onDelta(kind, text)
+		})
 		unlock()
-		return onDelta(kind, text)
-	})
-	unlock()
+		if err != nil {
+			break
+		}
+	}
 	if err != nil {
 		if errors.Is(err, elmcore.ErrSessionExpired) {
 			s.markExpired(true)
@@ -493,4 +516,46 @@ func (p *Pool) Chat(ctx context.Context, model, prompt string, onDelta func(elmc
 		s.setModel(model)
 	}
 	return nil
+}
+
+// splitContextPrefix marks intermediate context messages so the model answers
+// them briefly instead of producing a full answer.
+const splitContextPrefix = "（以下是对话上下文的一部分，请只回复 OK，不要展开）\n"
+
+// splitPrompt breaks an oversized prompt into ELM-sized messages, preferring
+// line boundaries and never splitting a UTF-8 rune.
+func splitPrompt(prompt string, limit int) []string {
+	if limit <= 0 || len(prompt) <= limit {
+		return []string{prompt}
+	}
+	var chunks []string
+	remaining := prompt
+	for len(remaining) > limit {
+		cut := strings.LastIndex(remaining[:limit], "\n")
+		if cut <= 0 {
+			cut = safeCut(remaining, limit)
+		} else {
+			cut++
+		}
+		chunks = append(chunks, remaining[:cut])
+		remaining = remaining[cut:]
+	}
+	if remaining != "" {
+		chunks = append(chunks, remaining)
+	}
+	return chunks
+}
+
+// safeCut returns the largest offset <= n that does not split a rune.
+func safeCut(s string, n int) int {
+	if n >= len(s) {
+		return len(s)
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	if n == 0 {
+		return len(s)
+	}
+	return n
 }

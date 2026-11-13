@@ -74,6 +74,7 @@ curl -X POST http://127.0.0.1:8787/api/sessions -H "Content-Type: application/js
   不要写成 `.../v1/chat/completions` 当 base_url。
 - **API key wrong**：默认不校验 key；只有 `config.json` 的 `api_keys` 非空时才校验。
 - **空回复（EMPTY_RESPONSE）**：ELM 网页端偶发断流，服务会自动重试；仍失败就直接重试请求。
+- **长 prompt 超限**：ELM 网页端单条消息上限约 16K 字符；超过时服务会自动把 prompt 切成多条消息依次发送（同一 chat），不需要你手动处理。
 - **只支持纯文本对话**：不支持工具调用、文件上传、图片输入。
 - **回答跑到浏览器里打开的聊天中**：旧版本复用会话当前 chat；新版本每个请求新建 chat，已修复。
 - **模型列表里只有 DeepSeek**：说明启动的是旧的 `ds2api-elm-*.exe`，请运行本包的 `elm2api.exe`（29 个网页端模型 + Qwen 等，共 31 个）。

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,6 +20,10 @@ func main() {
 	listen := flag.String("listen", "", "listen address, overrides config listen (default 127.0.0.1:8787)")
 	flag.Parse()
 
+	if v := strings.TrimSpace(os.Getenv("ELM_DEBUG")); v != "" && v != "0" && v != "false" {
+		elmcore.SetDebug(true)
+		log.Print("elm2api: ELM_DEBUG on, logging every upstream frame")
+	}
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("elm2api: %v", err)
