@@ -52,6 +52,11 @@ Linux：
 ### 工具调用
 
 `tools` / `tool_choice` 可用：服务把工具定义写进 prompt，模型按协议输出 JSON 调用，服务再翻译成标准 `tool_calls`（Chat Completions）或 `function_call`（Responses）。
+
+ELM 没有原生 function calling（网页端的 Web Search 是 ELM 服务端自己执行的，不回传 tool_calls）。另外 **ELM 会给每条消息套一层机构默认 prompt**，实测它会压过工具协议；所以服务在会话第一次聊天前会用 `GET /api/prompts` 找到账号里文本为空的模板（"Empty Prompt"），`PUT /api/settings/prompt` 选中它，并在每条消息里带上它的 id。日志会打印 `using ELM prompt template N (empty prompt)`；不想改这个设置可在配置里写 `"empty_prompt": false`。
+
+续聊只把**新增的用户内容 + 工具结果**发给 ELM：上一轮 assistant 回答不会回显（否则网页聊天里会出现重复段落，模型也容易复读）。如果模型把调用写成了普通文本，服务会在同一个 chat 里自动纠正一次再返回。
+
 带 tools 的流式请求会先缓冲整段回复再输出，非流式行为不变。
 prompt 超过 16K 会被切成多条 ELM 消息，**最后一片会重新附带一遍工具协议**，所以长对话（coding agent 那种几十万字符的 prompt）也能正常触发工具调用。
 
@@ -92,8 +97,9 @@ curl -X POST http://127.0.0.1:8787/api/sessions -H "Content-Type: application/js
   不要写成 `.../v1/chat/completions` 当 base_url。
 - **API key wrong**：默认不校验 key；只有 `config.json` 的 `api_keys` 非空时才校验。
 - **空回复（EMPTY_RESPONSE）**：ELM 网页端偶发断流，服务会自动重试；仍失败就直接重试请求（重试会复用同一个 chat，上下文不丢）。
+- **回答很慢 / 中途断线**：ELM 生成期间每秒推一个空的 AI 保活帧；服务要 120 秒收不到任何帧才算超时。broker 因部署/重启要求重试时（drain 的 `RETRY_QUERY`），如果还没有输出文本，服务会自动重连并把这一轮重发一次。
 - **长 prompt 超限**：ELM 网页端单条消息上限约 16K 字符；超过时服务会自动把 prompt 切成多条消息依次发送（同一 chat），不需要你手动处理。
-- **工具调用**：通过 prompt 协议模拟（ELM 无原生 function calling），参数由模型生成，客户端仍应校验；日志 `tools=N prompt=… tool_calls=0` 表示这次没解析到调用，回复会按普通文本返回。
+- **工具调用**：通过 prompt 协议模拟（ELM 无原生 function calling），参数由模型生成，客户端仍应校验；日志 `tool call written as text` 表示已自动纠正一次，`tool_calls=0` 才是最终按普通文本返回。若日志没有 `using ELM prompt template N (empty prompt)`，说明账号没有空模板或 `empty_prompt` 被关掉，ELM 默认 prompt 会干扰工具协议。
 - **只支持纯文本对话**：不支持文件上传、图片输入。
 - **回答跑到浏览器里打开的聊天中**：这是预期行为（API 伪装自网页聊天），历史会留在 ELM 网页端；回滚/新对话/换 session 时才会新建 chat，换模型不会。
 - **第二个请求很慢 / 日志出现 `queueing request`**：一个 ELM 账号同一时刻只能跑一个聊天，正常排队；要并行请配多个账号。
@@ -114,5 +120,6 @@ curl -X POST http://127.0.0.1:8787/api/sessions -H "Content-Type: application/js
 | `model_list_ttl_seconds` | 300 | 模型列表缓存时间 |
 | `check_interval_seconds` | 300 | cookie 巡检间隔，0 关闭 |
 | `state_file` | `elm2api-state.json` | 记录 chat id / Responses 映射（不含完整 prompt），留空则不落盘 |
+| `empty_prompt` | `true` | 每条消息前选中账号里的空 prompt 模板，压掉 ELM 默认机构 prompt；设为 `false` 则沿用 ELM 默认 |
 
-环境变量：`ELM_CONFIG`、`ELM_LISTEN`、`ELM_BASE_URL`、`ELM_MODEL`、`ELM_MAX_CONCURRENCY`、`ELM_API_KEYS`、`ELM_CHECK_INTERVAL`、`ELM_SESSION`。
+环境变量：`ELM_CONFIG`、`ELM_LISTEN`、`ELM_BASE_URL`、`ELM_MODEL`、`ELM_MAX_CONCURRENCY`、`ELM_API_KEYS`、`ELM_CHECK_INTERVAL`、`ELM_EMPTY_PROMPT`、`ELM_SESSION`。

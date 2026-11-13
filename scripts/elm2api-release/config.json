@@ -8,5 +8,6 @@
   "api_keys": [],
   "model_list_ttl_seconds": 300,
   "check_interval_seconds": 300,
-  "state_file": "elm2api-state.json"
+  "state_file": "elm2api-state.json",
+  "empty_prompt": true
 }

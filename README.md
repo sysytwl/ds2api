@@ -8,6 +8,7 @@
 - `POST /v1/responses`：OpenAI Responses API，`previous_response_id` 直接映射到 ELM 的 chat
 - 上下文存在 ELM 网页端：每段对话对应一个 chat，续聊只发新增内容，网页里可回看
 - 工具调用：模型按提示词里的协议输出 JSON 调用，服务翻译成标准 `tool_calls` / `function_call`
+- ELM 没有原生 function calling，且默认机构 prompt 会压过工具协议：服务首次聊天前会选中账号里的 “Empty Prompt” 模板，并在每条消息里带上它的 id（`empty_prompt: false` 可关闭）
 
 完整说明（登录、配置、chat 复用规则、并发限制、排错）见 [docs/ELM2API.md](docs/ELM2API.md)。
 

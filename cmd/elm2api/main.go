@@ -34,6 +34,7 @@ func main() {
 	upstream := elmcore.New(cfg.BaseURL)
 	pool := NewPool(upstream, cfg.DefaultModel, cfg.MaxConcurrency, cfg.QueueWaitSeconds, cfg.ModelListTTL)
 	pool.SetStatePath(cfg.StateFile)
+	pool.SetEmptyPrompt(cfg.emptyPromptEnabled())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	sessions := cfg.Sessions

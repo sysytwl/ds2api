@@ -137,17 +137,18 @@ func (m chatMessage) render() string {
 		}
 		return "System: " + text
 	case "assistant":
-		parts := make([]string, 0, 2)
-		if text != "" {
-			parts = append(parts, text)
-		}
-		if calls := m.callsText(); calls != "" {
-			parts = append(parts, calls)
-		}
-		if len(parts) == 0 {
+		calls := m.callsText()
+		if text == "" && calls == "" {
 			return ""
 		}
-		return "Assistant: " + strings.Join(parts, " ")
+		out := "Assistant: " + text
+		if calls != "" {
+			if text != "" {
+				out += "\n"
+			}
+			out += calls
+		}
+		return out
 	case "tool":
 		if text == "" {
 			return ""
@@ -156,7 +157,7 @@ func (m chatMessage) render() string {
 		if label == "" {
 			label = strings.TrimSpace(m.ToolCallID)
 		}
-		return "Tool result (" + label + "): " + text
+		return "Tool result (" + label + "): " + text + "\n" + toolResultReminder
 	default:
 		if text == "" {
 			return ""
@@ -165,19 +166,57 @@ func (m chatMessage) render() string {
 	}
 }
 
+// callsText renders the client's tool calls exactly the way the protocol asks
+// the model to write them, so the model recognises its own earlier call when
+// the conversation is replayed (the client only echoes name + arguments).
 func (m chatMessage) callsText() string {
 	if len(m.ToolCalls) == 0 {
 		return ""
 	}
-	out := make([]string, 0, len(m.ToolCalls))
+	calls := make([]map[string]any, 0, len(m.ToolCalls))
 	for _, call := range m.ToolCalls {
 		args := strings.TrimSpace(call.Function.Arguments)
-		if args == "" {
+		if args == "" || !json.Valid([]byte(args)) {
 			args = "{}"
 		}
-		out = append(out, fmt.Sprintf("[tool call %s(%s)]", call.Function.Name, args))
+		calls = append(calls, map[string]any{
+			"name":      call.Function.Name,
+			"arguments": json.RawMessage(args),
+		})
 	}
-	return strings.Join(out, " ")
+	raw, err := json.Marshal(map[string]any{"tool_calls": calls})
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+// trimEchoedAssistant removes the leading assistant blocks from a continuation
+// delta. The ELM chat already contains the model's own answer, so echoing it
+// back as a user message would duplicate the conversation (and can make the
+// model repeat itself). Tool results and user messages are kept.
+func trimEchoedAssistant(delta string) string {
+	s := strings.TrimLeft(delta, "\n")
+	if !strings.HasPrefix(s, "Assistant: ") {
+		return delta
+	}
+	for {
+		best := -1
+		for _, marker := range []string{"\n\nUser: ", "\n\nSystem: ", "\n\nTool result ("} {
+			if i := strings.Index(s, marker); i >= 0 && (best < 0 || i < best) {
+				best = i
+			}
+		}
+		if best < 0 {
+			return ""
+		}
+		next := s[best+2:]
+		if strings.HasPrefix(next, "Assistant: ") {
+			s = next
+			continue
+		}
+		return next
+	}
 }
 
 func newCompletionID() string {

@@ -20,7 +20,14 @@ type Config struct {
 	ModelListTTL     int             `json:"model_list_ttl_seconds"`
 	CheckInterval    int             `json:"check_interval_seconds"`
 	StateFile        string          `json:"state_file"`
+	// EmptyPrompt selects the account's blank ("Empty Prompt") template before
+	// every chat message, so ELM does not prepend its default institution
+	// prompt. Defaults to true; set it to false to keep the ELM default.
+	EmptyPrompt *bool `json:"empty_prompt"`
 }
+
+// emptyPromptEnabled reports whether the blank prompt template should be used.
+func (c Config) emptyPromptEnabled() bool { return c.EmptyPrompt == nil || *c.EmptyPrompt }
 
 // SessionConfig is one ELM browser session cookie.
 type SessionConfig struct {
@@ -82,6 +89,10 @@ func applyEnv(cfg *Config) {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.CheckInterval = n
 		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ELM_EMPTY_PROMPT")); v != "" {
+		enabled := !(v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "off") || strings.EqualFold(v, "no"))
+		cfg.EmptyPrompt = &enabled
 	}
 	if v := strings.TrimSpace(os.Getenv("ELM_SESSION")); v != "" {
 		cfg.Sessions = []SessionConfig{}

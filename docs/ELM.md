@@ -11,10 +11,10 @@
 - 每轮对话：
   1. `GET /api/chat-id` 取一个新的 chatId；
   2. `SUBSCRIBE /topic/query-<chatId>`；
-  3. `SEND /app/queue/query-<chatId>`，body 为 `{"query":"<纯文本提示词>","promptId":null}`；
+  3. `SEND /app/queue/query-<chatId>`，body 为 `{"query":"<纯文本提示词>","promptId":<空模板 id>}`；`promptId` 对应 ELM 账号里的一个 prompt 模板，空模板（"Empty Prompt"）可避免机构默认 prompt 干扰工具协议，传 `null` 时 ELM 会套用默认 prompt；
   4. 从订阅主题收到 `USER` 回显、`AI` 增量帧（`reply` 为增量文本）、以及 `CHAT_FINISHED` 结束帧。
 - 认证是浏览器 Cookie `SESSION=...`（HttpOnly）；模型是**会话级设置**（`GET/PUT /api/settings` 的 `model` 字段），不在单次聊天请求里。
-- `internal/elmweb` 负责以上协议，并把结果转换成 ds2api 现有的 DeepSeek SSE 格式，因此 OpenAI/Claude/Gemini/Responses、工具调用、历史等**全部沿用原有流水线**。
+- `internal/elmcore` 负责以上协议，并把结果转换成 ds2api 现有的 DeepSeek SSE 格式，因此 OpenAI/Claude/Gemini/Responses、工具调用、历史等**全部沿用原有流水线**。
 
 ## 2. 配置
 
@@ -102,9 +102,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 The repo can use the **ELM web chat** (`https://elm.edina.ac.uk`) as an upstream while still serving the standard OpenAI / Claude / Gemini / Responses APIs.
 
-How it works: the web app speaks **STOMP over WebSocket** (`wss://elm.edina.ac.uk/ws`). A chat round is `GET /api/chat-id` → `SUBSCRIBE /topic/query-<chatId>` → `SEND /app/queue/query-<chatId>` with `{"query": "...", "promptId": null}`; replies arrive as `USER` echo, incremental `AI` frames and a final `CHAT_FINISHED`. Auth is the browser `SESSION` cookie, and the model is a session-level setting (`/api/settings`).
+How it works: the web app speaks **STOMP over WebSocket** (`wss://elm.edina.ac.uk/ws`). A chat round is `GET /api/chat-id` → `SUBSCRIBE /topic/query-<chatId>` → `SEND /app/queue/query-<chatId>` with `{"query": "...", "promptId": <empty template id>}` (the id selects a prompt template; `null` applies ELM's default institution prompt); replies arrive as `USER` echo, incremental `AI` frames and a final `CHAT_FINISHED`. Auth is the browser `SESSION` cookie, and the model is a session-level setting (`/api/settings`).
 
-`internal/elmweb` implements the protocol and converts the stream into the existing DeepSeek SSE shape, so every ds2api surface keeps working.
+`internal/elmcore` implements the protocol and converts the stream into the existing DeepSeek SSE shape, so every ds2api surface keeps working.
 
 Configuration: set `"upstream": "elm"`, put the `SESSION` cookie into `accounts[].token`, and pick an ELM model id in `elm.model`.
 

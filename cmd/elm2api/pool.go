@@ -27,7 +27,9 @@ type Upstream interface {
 	NewChat(ctx context.Context, cookie string) (string, error)
 	SetModel(ctx context.Context, cookie, model string) error
 	CurrentModel(ctx context.Context, cookie string) (string, error)
-	StreamChat(ctx context.Context, cookie, chatID, prompt, model string, onDelta func(elmcore.DeltaKind, string) error) error
+	Prompts(ctx context.Context, cookie string) ([]elmcore.Prompt, error)
+	SelectPrompt(ctx context.Context, cookie string, id int64) error
+	StreamChat(ctx context.Context, cookie string, req elmcore.ChatRequest, onDelta func(elmcore.DeltaKind, string) error) error
 }
 
 var (
@@ -62,6 +64,14 @@ type Session struct {
 	// chat a conversation continues.
 	chatMu sync.Mutex
 	chats  []*chatRecord
+
+	// promptMu guards the lazily discovered "Empty Prompt" template. ELM
+	// prepends the selected template to every message; with promptId null it
+	// falls back to the institution default prompt, which competes with the
+	// tool protocol. Sending the empty template's id keeps the chat clean.
+	promptMu      sync.Mutex
+	promptID      int64
+	promptChecked bool
 }
 
 // newSession builds a session with an empty chat list and a free turn lock.
@@ -151,6 +161,10 @@ type Pool struct {
 
 	respMu    sync.Mutex
 	responses map[string]persistedResponse
+
+	// emptyPrompt selects the account's blank prompt template instead of
+	// letting ELM apply its default institution prompt.
+	emptyPrompt bool
 }
 
 // NewPool builds a session pool.
@@ -170,8 +184,13 @@ func NewPool(up Upstream, defaultModel string, maxConcurrency, queueWaitSeconds,
 		queueWait:    time.Duration(queueWaitSeconds) * time.Second,
 		sem:          make(chan struct{}, maxConcurrency),
 		modelsTTL:    time.Duration(modelTTLSeconds) * time.Second,
+		emptyPrompt:  true,
 	}
 }
+
+// SetEmptyPrompt enables or disables selecting the account's blank prompt
+// template before every chat message. It must be called before serving.
+func (p *Pool) SetEmptyPrompt(enabled bool) { p.emptyPrompt = enabled }
 
 // Add validates an ELM cookie and registers it as a session.
 func (p *Pool) Add(ctx context.Context, name, cookie string) (SessionView, error) {
@@ -498,11 +517,22 @@ func (p *Pool) Chat(ctx context.Context, model, prompt string, onDelta func(elmc
 // protocol only exists at the top of the prompt, so without the repeat a long
 // conversation reaches the model with no tool definitions in front of it.
 func (p *Pool) ChatTail(ctx context.Context, model, prompt, tail string, onDelta func(elmcore.DeltaKind, string) error) error {
-	return p.withSession(ctx, model, func(s *Session) error {
+	_, _, err := p.ChatTailID(ctx, model, prompt, tail, onDelta)
+	return err
+}
+
+// ChatTailID is ChatTail that also returns the ELM chat and session that
+// answered, so a caller can send a short follow-up into the same conversation
+// (the tool-call repair) without losing the chat.
+func (p *Pool) ChatTailID(ctx context.Context, model, prompt, tail string, onDelta func(elmcore.DeltaKind, string) error) (string, string, error) {
+	var chatID, sessionID string
+	err := p.withSession(ctx, model, func(s *Session) error {
+		sessionID = s.ID
 		rec, sendPrompt, err := p.prepareChat(ctx, s, prompt)
 		if err != nil {
 			return err
 		}
+		chatID = rec.ID
 		emitted := false
 		wrap := func(kind elmcore.DeltaKind, text string) error {
 			emitted = true
@@ -518,6 +548,7 @@ func (p *Pool) ChatTail(ctx context.Context, model, prompt, tail string, onDelta
 			}
 			log.Printf("elm2api: chat %s unusable (%v), opened %s instead", rec.ID, err, id)
 			rec = s.noteChat(id, prompt)
+			chatID = id
 			err = p.sendPrompt(ctx, s, id, prompt, tail, model, wrap)
 		}
 		if err != nil {
@@ -526,6 +557,10 @@ func (p *Pool) ChatTail(ctx context.Context, model, prompt, tail string, onDelta
 		s.rememberChat(rec, model, prompt)
 		return nil
 	})
+	if err != nil {
+		return "", "", err
+	}
+	return chatID, sessionID, nil
 }
 
 // ChatIn runs one prompt in a specific ELM chat (empty chatID opens a new one)
@@ -621,7 +656,14 @@ func (p *Pool) prepareChat(ctx context.Context, s *Session, prompt string) (*cha
 		send := prompt
 		if len(prompt) > rec.PrevLen {
 			if tail := strings.TrimLeft(prompt[rec.PrevLen:], " \t\r\n"); strings.TrimSpace(tail) != "" {
-				send = tail
+				// The ELM chat already holds the model's own answer, so a delta
+				// that starts with "Assistant: ..." only repeats it back as a
+				// user message. Send the new user text and tool results instead.
+				if lean := trimEchoedAssistant(tail); strings.TrimSpace(lean) != "" {
+					send = lean
+				} else {
+					send = tail
+				}
 			}
 		}
 		return rec, send, nil
@@ -655,6 +697,60 @@ func (p *Pool) openChat(ctx context.Context, s *Session) (string, error) {
 	return fallback, nil
 }
 
+// promptID returns the ELM prompt template sent with every message. It
+// discovers the account's blank ("Empty Prompt") template once and selects it,
+// so ELM does not prepend the institution default prompt (which makes the model
+// answer as the ELM assistant and ignore the tool protocol). A discovery
+// failure falls back to 0, i.e. "promptId": null.
+func (p *Pool) promptID(ctx context.Context, s *Session) int64 {
+	if !p.emptyPrompt {
+		return 0
+	}
+	s.promptMu.Lock()
+	if s.promptChecked {
+		id := s.promptID
+		s.promptMu.Unlock()
+		return id
+	}
+	s.promptMu.Unlock()
+
+	id, err := p.discoverPrompt(ctx, s)
+
+	s.promptMu.Lock()
+	s.promptChecked = true
+	s.promptID = id
+	s.promptMu.Unlock()
+	switch {
+	case err != nil:
+		if errors.Is(err, elmcore.ErrSessionExpired) {
+			s.markExpired(true)
+		}
+		log.Printf("elm2api: session %s: cannot use the empty prompt template (%v); the default ELM prompt will be applied", s.ID, err)
+	case id > 0:
+		log.Printf("elm2api: session %s: using ELM prompt template %d (empty prompt), default prompt suppressed", s.ID, id)
+	default:
+		log.Printf("elm2api: session %s: no empty ELM prompt template, the default prompt will be applied", s.ID)
+	}
+	return id
+}
+
+func (p *Pool) discoverPrompt(ctx context.Context, s *Session) (int64, error) {
+	prompts, err := p.up.Prompts(ctx, s.Cookie)
+	if err != nil {
+		return 0, err
+	}
+	id := elmcore.PickEmptyPrompt(prompts)
+	if id == 0 {
+		return 0, nil
+	}
+	// The id sent with each message is what decides the prompt; selecting it as
+	// the session default only keeps the web UI consistent with this service.
+	if err := p.up.SelectPrompt(ctx, s.Cookie, id); err != nil {
+		log.Printf("elm2api: session %s: select prompt %d: %v", s.ID, id, err)
+	}
+	return id, nil
+}
+
 // sendPrompt writes one prompt into chatID, splitting it when it exceeds the
 // ELM message limit. Only the final chunk's deltas reach onDelta.
 func (p *Pool) sendPrompt(ctx context.Context, s *Session, chatID, prompt, tail, model string, onDelta func(elmcore.DeltaKind, string) error) error {
@@ -662,6 +758,7 @@ func (p *Pool) sendPrompt(ctx context.Context, s *Session, chatID, prompt, tail,
 	if model != "" && s.Model() != model {
 		sendModel = model
 	}
+	promptID := p.promptID(ctx, s)
 	chunks := splitPromptWithTail(prompt, elmMaxPromptChars-len(splitContextPrefix), tail)
 	if len(chunks) > 1 {
 		log.Printf("elm2api: prompt split into %d messages (%d chars, tail %d chars, ELM limit ~%d)", len(chunks), len(prompt), len(tail), elmMaxPromptChars)
@@ -676,7 +773,12 @@ func (p *Pool) sendPrompt(ctx context.Context, s *Session, chatID, prompt, tail,
 		if i > 0 {
 			sendThis = ""
 		}
-		err := p.up.StreamChat(ctx, s.Cookie, chatID, body, sendThis, func(kind elmcore.DeltaKind, text string) error {
+		err := p.up.StreamChat(ctx, s.Cookie, elmcore.ChatRequest{
+			ChatID:   chatID,
+			Prompt:   body,
+			Model:    sendThis,
+			PromptID: promptID,
+		}, func(kind elmcore.DeltaKind, text string) error {
 			if !last {
 				return nil
 			}

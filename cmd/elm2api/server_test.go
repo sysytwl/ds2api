@@ -29,14 +29,20 @@ type fakeUpstream struct {
 	user          elmcore.User
 	streamPrompts []string
 	streamChats   []string
-	newChatCalls  int
-	quota         elmcore.Quota
-	failChat      error
+	// prompt template discovery (the "Empty Prompt" selection)
+	prompts           []elmcore.Prompt
+	selectedPromptIDs []int64
+	streamPromptIDs   []int64
+	newChatCalls      int
+	quota             elmcore.Quota
+	failChat          error
 	// failChatID, when set, restricts failChat to one chat id (a chat that was
 	// deleted in the web UI still answers, the other chats do not).
 	failChatID string
 	// reply replaces the default "hello" answer (used to script tool calls).
 	reply string
+	// replies scripts one answer per call, so a repair turn can be tested.
+	replies []string
 }
 
 func (f *fakeUpstream) IsLoggedIn(context.Context, string) (bool, error) {
@@ -74,12 +80,27 @@ func (f *fakeUpstream) SetModel(_ context.Context, _ string, model string) error
 func (f *fakeUpstream) CurrentModel(context.Context, string) (string, error) {
 	return "Qwen/Qwen3.5-397B-A17B-FP8", nil
 }
-func (f *fakeUpstream) StreamChat(ctx context.Context, _ string, chatID string, prompt, model string, onDelta func(elmcore.DeltaKind, string) error) error {
+func (f *fakeUpstream) Prompts(context.Context, string) ([]elmcore.Prompt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.prompts, nil
+}
+
+func (f *fakeUpstream) SelectPrompt(_ context.Context, _ string, id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.selectedPromptIDs = append(f.selectedPromptIDs, id)
+	return nil
+}
+
+func (f *fakeUpstream) StreamChat(ctx context.Context, _ string, req elmcore.ChatRequest, onDelta func(elmcore.DeltaKind, string) error) error {
 	f.mu.Lock()
 	f.chatCalls++
-	f.streamModels = append(f.streamModels, model)
-	f.streamPrompts = append(f.streamPrompts, prompt)
-	f.streamChats = append(f.streamChats, chatID)
+	f.streamModels = append(f.streamModels, req.Model)
+	f.streamPrompts = append(f.streamPrompts, req.Prompt)
+	f.streamChats = append(f.streamChats, req.ChatID)
+	f.streamPromptIDs = append(f.streamPromptIDs, req.PromptID)
+	chatID := req.ChatID
 	f.active++
 	if f.active > f.maxActive {
 		f.maxActive = f.active
@@ -87,6 +108,11 @@ func (f *fakeUpstream) StreamChat(ctx context.Context, _ string, chatID string, 
 	fail := f.failChat
 	if fail != nil && f.failChatID != "" && f.failChatID != chatID {
 		fail = nil
+	}
+	reply := f.reply
+	if len(f.replies) > 0 {
+		reply = f.replies[0]
+		f.replies = f.replies[1:]
 	}
 	f.mu.Unlock()
 	defer func() {
@@ -110,12 +136,12 @@ func (f *fakeUpstream) StreamChat(ctx context.Context, _ string, chatID string, 
 	if err := onDelta(elmcore.DeltaThinking, "thinking"); err != nil {
 		return err
 	}
-	if f.reply != "" {
-		half := len(f.reply) / 2
-		if err := onDelta(elmcore.DeltaContent, f.reply[:half]); err != nil {
+	if reply != "" {
+		half := len(reply) / 2
+		if err := onDelta(elmcore.DeltaContent, reply[:half]); err != nil {
 			return err
 		}
-		return onDelta(elmcore.DeltaContent, f.reply[half:])
+		return onDelta(elmcore.DeltaContent, reply[half:])
 	}
 	if err := onDelta(elmcore.DeltaContent, "he"); err != nil {
 		return err

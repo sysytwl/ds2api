@@ -114,6 +114,33 @@ type Model struct {
 	Traits           any    `json:"traits"`
 }
 
+// Prompt is one saved prompt template from GET /api/prompts. ELM prepends the
+// selected template's text to every chat message, so the web app always sends
+// its id as "promptId" in the STOMP query body. A blank template ("Empty
+// Prompt") is how the web chat stays free of the institution-wide default
+// prompt, which otherwise competes with the tool protocol this service adds.
+type Prompt struct {
+	ID       int64  `json:"id"`
+	Name     string `json:"name"`
+	Category string `json:"category"`
+	Prompt   string `json:"prompt"`
+	IsUser   bool   `json:"isUser"`
+}
+
+// ChatRequest is one turn sent to the ELM chat.
+type ChatRequest struct {
+	ChatID string
+	Prompt string
+	Model  string
+	// PromptID selects the ELM prompt template; 0 sends "promptId": null, which
+	// makes ELM fall back to its default institution prompt.
+	PromptID int64
+}
+
+// ErrEmptyPromptMissing means the account has no prompt template with empty
+// text, so the service cannot suppress the default prompt.
+var ErrEmptyPromptMissing = errors.New("elm: no empty prompt template is available")
+
 // Client talks to the ELM web backend with a browser session cookie.
 type Client struct {
 	baseURL string
@@ -301,6 +328,73 @@ func (c *Client) Models(ctx context.Context, cookie string) ([]Model, error) {
 	return out, nil
 }
 
+// Prompts lists the prompt templates the web app offers.
+func (c *Client) Prompts(ctx context.Context, cookie string) ([]Prompt, error) {
+	cookie, err := validateCookie(cookie)
+	if err != nil {
+		return nil, err
+	}
+	var out []Prompt
+	if err := c.doJSON(ctx, http.MethodGet, "/api/prompts", cookie, nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// EmptyPromptID returns the id of the blank prompt template ("Empty Prompt").
+// Sending that id keeps the default institution prompt out of the chat.
+func (c *Client) EmptyPromptID(ctx context.Context, cookie string) (int64, error) {
+	prompts, err := c.Prompts(ctx, cookie)
+	if err != nil {
+		return 0, err
+	}
+	id := PickEmptyPrompt(prompts)
+	if id == 0 {
+		return 0, ErrEmptyPromptMissing
+	}
+	return id, nil
+}
+
+// PickEmptyPrompt prefers a blank template whose name mentions "empty", then
+// any blank template.
+func PickEmptyPrompt(prompts []Prompt) int64 {
+	var fallback int64
+	for _, prompt := range prompts {
+		if strings.TrimSpace(prompt.Prompt) != "" {
+			continue
+		}
+		if strings.Contains(strings.ToLower(prompt.Name), "empty") {
+			return prompt.ID
+		}
+		if fallback == 0 {
+			fallback = prompt.ID
+		}
+	}
+	return fallback
+}
+
+// SelectPrompt makes a prompt template the session's default. The web app does
+// this when the user picks a template; the per-query promptId is still sent
+// explicitly with every chat message.
+func (c *Client) SelectPrompt(ctx context.Context, cookie string, id int64) error {
+	cookie, err := validateCookie(cookie)
+	if err != nil {
+		return err
+	}
+	if id <= 0 {
+		return nil
+	}
+	headerName, token, err := c.CSRF(ctx, cookie)
+	if err != nil {
+		return err
+	}
+	headers := map[string]string{}
+	if headerName != "" && token != "" {
+		headers[headerName] = token
+	}
+	return c.doJSON(ctx, http.MethodPut, "/api/settings/prompt", cookie, headers, id, nil)
+}
+
 // CSRF fetches the token required for mutating requests and STOMP CONNECT.
 func (c *Client) CSRF(ctx context.Context, cookie string) (headerName, token string, err error) {
 	cookie, err = validateCookie(cookie)
@@ -413,33 +507,66 @@ func (c *Client) SetModel(ctx context.Context, cookie, model string) error {
 	return nil
 }
 
+// errChatRetry is returned when the broker asks this client to resend the query
+// on a fresh connection (a drain notification). The ELM web app does the same:
+// it forces a reconnect and republishes the stored query body once.
+var errChatRetry = errors.New("elm: broker asked to retry the query")
+
+// drainNotice is the payload the broker publishes on
+// /user/exchange/amq.direct/drain. RECONNECT (chatId null) means "reconnect
+// when idle"; RETRY_QUERY names a chat whose query must be resent.
+type drainNotice struct {
+	Type   string  `json:"type"`
+	ChatID *string `json:"chatId"`
+}
+
+func isDrainNotice(body string) bool {
+	body = strings.TrimSpace(body)
+	return strings.HasPrefix(body, "{") && strings.Contains(body, `"type"`)
+}
+
+// wantsRetry reports whether a drain notice asks for this chat to be resent.
+func wantsRetry(body, chatID string) bool {
+	var notice drainNotice
+	if err := json.Unmarshal([]byte(body), &notice); err != nil {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(notice.Type)) {
+	case "RECONNECT":
+		return notice.ChatID == nil
+	case "RETRY_QUERY":
+		return notice.ChatID != nil && strings.TrimSpace(*notice.ChatID) == chatID
+	default:
+		return false
+	}
+}
+
 // StreamChat sends one prompt to the ELM web chat and calls onDelta for every
 // streamed chunk until the chat finishes. A non-empty model switches the
-// session model first. onDelta returning an error aborts the stream.
-// StreamChat sends one prompt to the ELM web chat and calls onDelta for every
-// streamed chunk until the chat finishes. A non-empty model switches the
-// session model first. onDelta returning an error aborts the stream.
+// session model first, and a non-zero PromptID selects the prompt template
+// (0 sends "promptId": null, which lets ELM fall back to its default prompt).
+// onDelta returning an error aborts the stream.
 //
 // The ELM websocket gateway occasionally drops a brand-new chat socket when the
 // previous chat connection has not been reaped server side yet. Because nothing
 // has been sent to the model at that point, opening the chat stream is retried
 // a few times with a short backoff.
-func (c *Client) StreamChat(ctx context.Context, cookie, chatID, prompt, model string, onDelta func(DeltaKind, string) error) error {
+func (c *Client) StreamChat(ctx context.Context, cookie string, req ChatRequest, onDelta func(DeltaKind, string) error) error {
 	cookie, err := validateCookie(cookie)
 	if err != nil {
 		return err
 	}
-	prompt = strings.TrimSpace(prompt)
-	if prompt == "" {
+	req.Prompt = strings.TrimSpace(req.Prompt)
+	if req.Prompt == "" {
 		return errors.New("elm: empty prompt")
 	}
-	if model != "" {
+	if model := strings.TrimSpace(req.Model); model != "" {
 		if err := c.SetModel(ctx, cookie, model); err != nil {
 			return err
 		}
 	}
-	if strings.TrimSpace(chatID) == "" {
-		chatID, err = c.NewChat(ctx, cookie)
+	if strings.TrimSpace(req.ChatID) == "" {
+		req.ChatID, err = c.NewChat(ctx, cookie)
 		if err != nil {
 			return err
 		}
@@ -449,24 +576,56 @@ func (c *Client) StreamChat(ctx context.Context, cookie, chatID, prompt, model s
 		return err
 	}
 
-	var ws *wsConn
-	for attempt := 0; ; attempt++ {
-		ws, err = c.openChatStream(ctx, cookie, chatID, prompt, headerName, csrfToken)
-		if err == nil {
-			break
-		}
-		if attempt+1 >= chatStartAttempts || ctx.Err() != nil {
+	// A drain notification asks for one clean retry on a fresh connection. It is
+	// only honoured while no text reached the client, so a retry can never
+	// duplicate a streamed answer.
+	for round := 0; round < 2; round++ {
+		ws, err := c.openChatStreamWithRetry(ctx, cookie, req, headerName, csrfToken)
+		if err != nil {
 			return err
 		}
-		delay := chatStartBackoff * time.Duration(attempt+1)
+		emitted := false
+		readErr := c.readChatStreamWithContext(ctx, ws, req.ChatID, &emitted, func(kind DeltaKind, text string) error {
+			emitted = true
+			return onDelta(kind, text)
+		})
+		_ = ws.Close()
+		if readErr == nil {
+			return nil
+		}
+		if errors.Is(readErr, errChatRetry) && !emitted {
+			debugf("chat %s: broker asked for a retry, reconnecting", req.ChatID)
+			continue
+		}
+		return readErr
+	}
+	return errChatRetry
+}
+
+// openChatStreamWithRetry opens the chat socket, retrying the initial
+// connection while the previous chat socket is still being reaped server side.
+func (c *Client) openChatStreamWithRetry(ctx context.Context, cookie string, req ChatRequest, headerName, csrfToken string) (*wsConn, error) {
+	var lastErr error
+	for attempt := 0; attempt < chatStartAttempts; attempt++ {
+		ws, err := c.openChatStream(ctx, cookie, req, headerName, csrfToken)
+		if err == nil {
+			return ws, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(delay):
+			return nil, ctx.Err()
+		case <-time.After(chatStartBackoff * time.Duration(attempt+1)):
 		}
 	}
-	defer func() { _ = ws.Close() }()
+	return nil, lastErr
+}
 
+// readChatStreamWithContext closes the socket when the request context ends.
+func (c *Client) readChatStreamWithContext(ctx context.Context, ws *wsConn, chatID string, emitted *bool, onDelta func(DeltaKind, string) error) error {
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -476,18 +635,17 @@ func (c *Client) StreamChat(ctx context.Context, cookie, chatID, prompt, model s
 		case <-done:
 		}
 	}()
-
-	return c.readChatStream(ctx, ws, onDelta)
+	return c.readChatStream(ctx, ws, chatID, emitted, onDelta)
 }
 
 // openChatStream dials the chat websocket, performs the STOMP handshake,
 // subscribes to the chat topic and submits the prompt.
-func (c *Client) openChatStream(ctx context.Context, cookie, chatID, prompt, headerName, csrfToken string) (*wsConn, error) {
+func (c *Client) openChatStream(ctx context.Context, cookie string, req ChatRequest, headerName, csrfToken string) (*wsConn, error) {
 	ws, err := dialWebSocket(ctx, c.wsURL(), map[string]string{"Cookie": cookie, "Origin": c.baseURL})
 	if err != nil {
 		return nil, err
 	}
-	debugf("open chat=%s prompt=%d bytes", chatID, len(prompt))
+	debugf("open chat=%s prompt=%d bytes promptId=%d", req.ChatID, len(req.Prompt), req.PromptID)
 	ok := false
 	defer func() {
 		if !ok {
@@ -531,16 +689,29 @@ func (c *Client) openChatStream(ctx context.Context, cookie, chatID, prompt, hea
 
 	if err := ws.WriteMessage(encodeStompFrame("SUBSCRIBE", []stompHeader{
 		{Key: "id", Value: "sub-0"},
-		{Key: "destination", Value: "/topic/query-" + chatID},
+		{Key: "destination", Value: "/topic/query-" + req.ChatID},
 	}, "")); err != nil {
 		return nil, fmt.Errorf("elm: stomp subscribe: %w", err)
 	}
-	queryBody, err := json.Marshal(map[string]any{"query": prompt, "promptId": nil})
+	// The broker publishes drain notifications here when a backend node is
+	// shutting down or asks for the query to be retried (the web app uses the
+	// same destination). The reply is delivered on the chat subscription.
+	if err := ws.WriteMessage(encodeStompFrame("SUBSCRIBE", []stompHeader{
+		{Key: "id", Value: "sub-drain"},
+		{Key: "destination", Value: "/user/exchange/amq.direct/drain"},
+	}, "")); err != nil {
+		return nil, fmt.Errorf("elm: stomp subscribe drain: %w", err)
+	}
+	payload := map[string]any{"query": req.Prompt, "promptId": nil}
+	if req.PromptID > 0 {
+		payload["promptId"] = req.PromptID
+	}
+	queryBody, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
 	if err := ws.WriteMessage(encodeStompFrame("SEND", []stompHeader{
-		{Key: "destination", Value: "/app/queue/query-" + chatID},
+		{Key: "destination", Value: "/app/queue/query-" + req.ChatID},
 		{Key: "content-type", Value: "application/json"},
 		{Key: "content-length", Value: strconv.Itoa(len(queryBody))},
 	}, string(queryBody))); err != nil {
@@ -551,7 +722,7 @@ func (c *Client) openChatStream(ctx context.Context, cookie, chatID, prompt, hea
 }
 
 // readChatStream consumes chat events until the chat finishes.
-func (c *Client) readChatStream(ctx context.Context, ws *wsConn, onDelta func(DeltaKind, string) error) error {
+func (c *Client) readChatStream(ctx context.Context, ws *wsConn, chatID string, emitted *bool, onDelta func(DeltaKind, string) error) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -573,6 +744,14 @@ func (c *Client) readChatStream(ctx context.Context, ws *wsConn, onDelta func(De
 			return fmt.Errorf("elm: chat stream error: %s", frame.Header("message"))
 		case "MESSAGE":
 		default:
+			continue
+		}
+		if sub := frame.Header("subscription"); sub == "sub-drain" || (sub == "" && isDrainNotice(frame.Body)) {
+			if wantsRetry(frame.Body, chatID) && (emitted == nil || !*emitted) {
+				return errChatRetry
+			}
+			// Once text reached the client a retry cannot be replayed without
+			// duplicating it, so the notice is ignored and the stream goes on.
 			continue
 		}
 		event, err := parseChatEvent(frame.Body)

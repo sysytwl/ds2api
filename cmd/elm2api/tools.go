@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -98,34 +99,32 @@ func toolChoice(raw json.RawMessage) (string, string) {
 // to travel as text and be translated back into tool_calls by this service.
 func toolInstructions(tools []toolSpec, mode, forced string) string {
 	var b strings.Builder
-	b.WriteString("# 工具调用协议（必须严格遵守）\n\n")
-	b.WriteString("需要调用工具时，整个回答只输出一个 JSON 代码块，前面后面都不要写任何解释：\n\n")
-	b.WriteString("```json\n")
-	b.WriteString("{\"tool_calls\":[{\"name\":\"工具名\",\"arguments\":{\"参数\":\"值\"}}]}")
-	b.WriteString("\n```\n\n")
-	b.WriteString("规则：\n")
-	b.WriteString("1. 代码块语言标记必须是 json，内容是单个对象，键名是 tool_calls。\n")
-	b.WriteString("2. arguments 必须是 JSON 对象，键名和类型严格符合该工具的 JSON Schema，不要发明字段。\n")
-	b.WriteString("3. 需要多个调用时，把多个 {name, arguments} 放进同一个 tool_calls 数组。\n")
-	b.WriteString("4. 字符串里的换行写成 \\n，不要写成真实换行或 YAML/XML。\n")
-	b.WriteString("5. 工具执行结果会以 \"Tool result (<工具名>):\" 出现在后续对话里；拿到结果后再继续。\n")
-	b.WriteString("6. 不需要调用工具时，直接用自然语言回答，不要输出任何 JSON 代码块。\n")
-	b.WriteString("7. 不要假装工具已经执行，也不要一边说\"我来执行\"一边给代码块；要调用就直接给代码块。\n\n")
-	b.WriteString("反例（都不要这样做）：\n")
-	b.WriteString("- 在代码块前后写\"好的，我来运行 git status\"。\n")
-	b.WriteString("- 用 ```yaml 或 ```xml 写调用，或写成裸 XML。\n")
-	b.WriteString("- 编造参数（例如把 command 写成空字符串）。\n")
+	b.WriteString("# 工具调用\n\n")
+	b.WriteString("需要调用工具时，在回复中输出一个 ```json 代码块，内容形如：\n")
+	b.WriteString("{\"tool_calls\":[{\"name\":\"工具名\",\"arguments\":{\"参数\":\"值\"}}]}\n\n")
+	b.WriteString("可以先用一句话说明意图。arguments 必须是符合该工具 schema 的 JSON 对象；不要编造工具执行结果。\n")
+	b.WriteString("工具执行结果会以 \"Tool result (工具名): ...\" 出现在后续对话里，拿到结果后再继续回答。\n")
+	b.WriteString("不需要调用工具时，直接用自然语言回答。\n")
 	if forced != "" {
-		b.WriteString(fmt.Sprintf("- 本次请求必须调用工具 %q。\n", forced))
+		b.WriteString(fmt.Sprintf("\n本次请求必须调用工具 %q。\n", forced))
 	} else if mode == "required" {
-		b.WriteString("- 本次请求必须调用至少一个工具。\n")
+		b.WriteString("\n本次请求必须调用至少一个工具。\n")
 	}
 	b.WriteString("\n## 可用工具\n\n")
 	for _, tool := range tools {
-		b.WriteString(fmt.Sprintf("### %s\n%s\n参数 schema：%s\n\n", tool.Name, strings.TrimSpace(tool.Description), compactJSON(tool.Parameters)))
+		b.WriteString("### " + tool.Name + "\n")
+		if desc := strings.TrimSpace(tool.Description); desc != "" {
+			b.WriteString(desc + "\n")
+		}
+		b.WriteString("参数 schema：" + compactJSON(tool.Parameters) + "\n\n")
 	}
 	return b.String()
 }
+
+// toolResultReminder follows every tool result. It lives in the canonical
+// prompt (so prefix continuation keeps working) and puts the protocol at the
+// end of the message the model answers, where instructions are followed best.
+const toolResultReminder = "（如果还需要工具，只输出 json 代码块；否则直接回答。）"
 
 func compactJSON(raw json.RawMessage) string {
 	var v any
@@ -137,6 +136,46 @@ func compactJSON(raw json.RawMessage) string {
 		return string(raw)
 	}
 	return string(out)
+}
+
+// repairJSONText makes one last attempt at a call block that is almost JSON:
+// "` json" fences leave the language tag in the body, models sometimes close
+// the block with a full stop, and Chinese punctuation leaks in.
+func repairJSONText(text string) string {
+	t := strings.TrimSpace(text)
+	t = strings.TrimPrefix(t, "```")
+	t = strings.TrimSpace(t)
+	if len(t) > 4 && strings.HasPrefix(strings.ToLower(t), "json") {
+		t = strings.TrimSpace(t[4:])
+	}
+	if i := strings.LastIndexAny(t, "}]"); i >= 0 && i+1 < len(t) {
+		if rest := strings.TrimSpace(t[i+1:]); rest != "" && strings.ContainsAny(rest, "。．,，;；\u0060") {
+			t = strings.TrimSpace(t[:i+1])
+		}
+	}
+	replacer := strings.NewReplacer("“", "\"", "”", "\"", "：", ":", "，", ",")
+	return replacer.Replace(t)
+}
+
+// looksLikeToolAttempt reports whether a reply tried to call a tool even though
+// the parser could not turn it into one (used to trigger a single repair turn
+// and to log the raw reply).
+func looksLikeToolAttempt(reply string) bool {
+	return strings.Contains(reply, "tool_calls") ||
+		strings.Contains(reply, "<tool_call>") ||
+		(strings.Contains(reply, "\"name\"") && strings.Contains(reply, "\"arguments\""))
+}
+
+// toolRetryPrompt is sent into the same chat when the model wrote a call as
+// plain text. Keeping it short leaves the conversation context in place.
+func toolRetryPrompt(tools []toolSpec) string {
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		names = append(names, tool.Name)
+	}
+	return "你上一条回复把工具调用写成了普通文本，没有按协议输出。现在请只输出一个 ```json 代码块，内容形如：\n" +
+		"{\"tool_calls\":[{\"name\":\"工具名\",\"arguments\":{...}}]}\n" +
+		"可用工具：" + strings.Join(names, "、") + "。不要输出解释或其它代码块。"
 }
 
 // invokedTool is one tool call parsed out of the model's reply.
@@ -186,9 +225,87 @@ func parseToolCalls(reply string, tools []toolSpec) ([]invokedTool, string) {
 		if parsed, ok := parseToolBlock(reply, known); ok {
 			return parsed, ""
 		}
+		// Some models put the object right after a sentence and forget the
+		// fence ("我将读取文件：{\"tool_calls\": ...}"). Only a JSON value that
+		// really looks like a call is accepted here; otherwise the text stays
+		// a normal answer.
+		if parsed, rest, ok := extractEmbeddedCall(reply, known); ok {
+			return parsed, rest
+		}
 		return nil, reply
 	}
 	return calls, strings.TrimSpace(rest)
+}
+
+// extractEmbeddedCall finds the first JSON object/array in text that decodes
+// into at least one tool call and returns it with the surrounding text.
+func extractEmbeddedCall(text string, known map[string]bool) ([]invokedTool, string, bool) {
+	for i := 0; i < len(text); i++ {
+		if text[i] != '{' && text[i] != '[' {
+			continue
+		}
+		dec := json.NewDecoder(strings.NewReader(text[i:]))
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			continue
+		}
+		if !looksLikeCallJSON(raw) {
+			continue
+		}
+		calls, ok := decodeToolJSON(raw)
+		if !ok {
+			continue
+		}
+		if calls = filterKnownCalls(calls, known); len(calls) == 0 {
+			continue
+		}
+		rest := strings.TrimSpace(text[:i] + text[i+int(dec.InputOffset()):])
+		return calls, rest, true
+	}
+	return nil, "", false
+}
+
+// looksLikeCallJSON guards against turning an ordinary JSON snippet in an
+// answer ({"name":"..."}) into a fake tool call.
+func looksLikeCallJSON(raw json.RawMessage) bool {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return false
+	}
+	if raw[0] == '[' {
+		var items []json.RawMessage
+		if err := json.Unmarshal(raw, &items); err != nil {
+			return false
+		}
+		for _, item := range items {
+			if looksLikeCallJSON(item) {
+				return true
+			}
+		}
+		return false
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return false
+	}
+	if _, ok := probe["tool_calls"]; ok {
+		return true
+	}
+	_, hasName := probe["name"]
+	_, hasArgs := probe["arguments"]
+	_, hasParams := probe["parameters"]
+	if hasName && (hasArgs || hasParams) {
+		return true
+	}
+	if fn, ok := probe["function"]; ok {
+		var inner map[string]json.RawMessage
+		if err := json.Unmarshal(fn, &inner); err == nil {
+			if _, ok := inner["name"]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func parseToolBlock(body string, known map[string]bool) ([]invokedTool, bool) {
@@ -198,7 +315,16 @@ func parseToolBlock(body string, known map[string]bool) ([]invokedTool, bool) {
 	}
 	if strings.HasPrefix(text, "{") || strings.HasPrefix(text, "[") {
 		if calls, ok := decodeToolJSON([]byte(text)); ok {
-			return calls, true
+			if calls = filterKnownCalls(calls, known); len(calls) > 0 {
+				return calls, true
+			}
+		}
+		if repaired := repairJSONText(text); repaired != text {
+			if calls, ok := decodeToolJSON([]byte(repaired)); ok {
+				if calls = filterKnownCalls(calls, known); len(calls) > 0 {
+					return calls, true
+				}
+			}
 		}
 	}
 	lines := strings.Split(text, "\n")
@@ -248,7 +374,32 @@ func parseScalar(value string) any {
 	return strings.Trim(value, "\"")
 }
 
+// decodeToolJSON accepts one call envelope or a bare array of calls.
 func decodeToolJSON(raw []byte) ([]invokedTool, bool) {
+	if calls, ok := decodeToolEnvelope(raw); ok {
+		return calls, true
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, false
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(trimmed, &items); err != nil {
+		return nil, false
+	}
+	var calls []invokedTool
+	for _, item := range items {
+		if parsed, ok := decodeToolEnvelope(item); ok {
+			calls = append(calls, parsed...)
+		}
+	}
+	if len(calls) == 0 {
+		return nil, false
+	}
+	return calls, true
+}
+
+func decodeToolEnvelope(raw []byte) ([]invokedTool, bool) {
 	var envelope struct {
 		ToolCalls []struct {
 			Name      string          `json:"name"`
@@ -289,6 +440,21 @@ func decodeToolJSON(raw []byte) ([]invokedTool, bool) {
 		return []invokedTool{call}, true
 	}
 	return nil, false
+}
+
+// filterKnownCalls drops calls to names the client did not declare, so an
+// ordinary JSON example in an answer is not mistaken for a tool call.
+func filterKnownCalls(calls []invokedTool, known map[string]bool) []invokedTool {
+	if len(known) == 0 {
+		return calls
+	}
+	out := calls[:0]
+	for _, call := range calls {
+		if known[call.Name] {
+			out = append(out, call)
+		}
+	}
+	return out
 }
 
 func buildInvoked(name string, args json.RawMessage) (invokedTool, bool) {

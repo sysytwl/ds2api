@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -325,7 +326,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var content, thinking strings.Builder
-	err = s.pool.ChatTail(r.Context(), resolved, prompt, tail, func(kind elmcore.DeltaKind, text string) error {
+	chatID, _, err := s.pool.ChatTailID(r.Context(), resolved, prompt, tail, func(kind elmcore.DeltaKind, text string) error {
 		if kind == elmcore.DeltaThinking {
 			thinking.WriteString(text)
 		} else {
@@ -343,6 +344,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	if toolsEnabled {
 		calls, rest := parseToolCalls(content.String(), tools)
+		if len(calls) == 0 && looksLikeToolAttempt(content.String()) {
+			calls, rest = s.repairToolCall(r.Context(), resolved, chatID, tools, content.String(), &thinking)
+		}
 		log.Printf("elm2api: tools=%d prompt=%d reply=%d tool_calls=%d", len(tools), len(prompt), content.Len(), len(calls))
 		if len(calls) > 0 {
 			writeJSON(w, http.StatusOK, toolCompletionPayload(id, displayModel, calls, rest))
@@ -350,6 +354,38 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, completionPayload(id, displayModel, content.String(), thinking.String()))
+}
+
+// repairToolCall sends one short corrective message into the same ELM chat when
+// the model wrote a tool call as plain text. The original reply is kept when
+// the repair turn fails, so a false positive never loses an answer.
+func (s *Server) repairToolCall(ctx context.Context, model, chatID string, tools []toolSpec, original string, thinking *strings.Builder) ([]invokedTool, string) {
+	if strings.TrimSpace(chatID) == "" {
+		return nil, original
+	}
+	log.Printf("elm2api: tool call written as text (chat=%s), retrying once: %.300q", chatID, original)
+	var content, thought strings.Builder
+	_, _, err := s.pool.ChatInTail(ctx, model, toolRetryPrompt(tools), chatID, "", func(kind elmcore.DeltaKind, text string) error {
+		if kind == elmcore.DeltaThinking {
+			thought.WriteString(text)
+			return nil
+		}
+		content.WriteString(text)
+		return nil
+	})
+	if err != nil {
+		log.Printf("elm2api: tool-call repair failed: %v", err)
+		return nil, original
+	}
+	calls, rest := parseToolCalls(content.String(), tools)
+	if len(calls) == 0 {
+		log.Printf("elm2api: tool-call repair produced no call: %.300q", content.String())
+		return nil, original
+	}
+	if thinking != nil {
+		thinking.WriteString(thought.String())
+	}
+	return calls, rest
 }
 
 // streamToolCompletion buffers the reply, because a text tool call can only be
@@ -362,7 +398,7 @@ func (s *Server) streamToolCompletion(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 	var content, thinking strings.Builder
-	err := s.pool.ChatTail(r.Context(), resolved, prompt, tail, func(kind elmcore.DeltaKind, text string) error {
+	chatID, _, err := s.pool.ChatTailID(r.Context(), resolved, prompt, tail, func(kind elmcore.DeltaKind, text string) error {
 		if kind == elmcore.DeltaThinking {
 			thinking.WriteString(text)
 			return nil
@@ -396,6 +432,9 @@ func (s *Server) streamToolCompletion(w http.ResponseWriter, r *http.Request, id
 		emit(chunkPayload(id, displayModel, created, map[string]any{"role": "assistant", "reasoning_content": thinking.String()}))
 	}
 	calls, rest := parseToolCalls(content.String(), tools)
+	if len(calls) == 0 && looksLikeToolAttempt(content.String()) {
+		calls, rest = s.repairToolCall(r.Context(), resolved, chatID, tools, content.String(), &thinking)
+	}
 	log.Printf("elm2api: tools=%d prompt=%d reply=%d tool_calls=%d", len(tools), len(prompt), content.Len(), len(calls))
 	if len(calls) > 0 {
 		delta := map[string]any{"role": "assistant", "content": nil, "tool_calls": streamingToolCalls(calls)}

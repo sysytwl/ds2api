@@ -255,7 +255,15 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		output = append(output, reasoningItem(newItemID("rs"), reasoning))
 	}
 	if toolsEnabled {
-		if calls, rest := parseToolCalls(content.String(), tools); len(calls) > 0 {
+		calls, rest := parseToolCalls(content.String(), tools)
+		if len(calls) == 0 && looksLikeToolAttempt(content.String()) {
+			calls, rest = s.repairToolCall(r.Context(), resolved, usedChat, tools, content.String(), &thinking)
+			if len(calls) > 0 {
+				content.Reset()
+				content.WriteString(rest)
+			}
+		}
+		if len(calls) > 0 {
 			output = append(output, functionCallItems(calls)...)
 			if strings.TrimSpace(rest) != "" {
 				output = append(output, messageItem(newItemID("msg"), rest))
@@ -539,6 +547,13 @@ func (s *Server) streamResponseWithTools(w http.ResponseWriter, r *http.Request,
 		s.rememberResponse(id, usedChat, sessionID, resolved)
 	}
 	calls, rest := parseToolCalls(content.String(), tools)
+	if len(calls) == 0 && looksLikeToolAttempt(content.String()) {
+		calls, rest = s.repairToolCall(r.Context(), resolved, usedChat, tools, content.String(), &thinking)
+		if len(calls) > 0 {
+			content.Reset()
+			content.WriteString(rest)
+		}
+	}
 	sequence := 0
 	emit := func(event string, payload map[string]any) {
 		payload["type"] = event

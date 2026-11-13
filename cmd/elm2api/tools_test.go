@@ -97,7 +97,7 @@ func TestBuildPromptWithToolsAndResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"# 工具调用协议", "### pwsh", "User: status?", "[tool call pwsh(", "Tool result (call_1): clean"} {
+	for _, want := range []string{"# 工具调用", "### pwsh", "User: status?", "\"command\":\"git status\"", "\"name\":\"pwsh\"", "Tool result (call_1): clean"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q\n%s", want, prompt)
 		}

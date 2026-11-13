@@ -61,7 +61,7 @@ func TestChatToolsSurviveLongPrompt(t *testing.T) {
 	if len(prompts) < 2 {
 		t.Fatalf("expected the prompt to be split, got %d upstream call(s)", len(prompts))
 	}
-	if last := prompts[len(prompts)-1]; !strings.Contains(last, "工具调用协议") {
+	if last := prompts[len(prompts)-1]; !strings.Contains(last, "工具调用") {
 		t.Fatal("the last chunk does not repeat the tool protocol")
 	}
 	out := string(raw)
